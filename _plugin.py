@@ -21,7 +21,8 @@ log = logging.getLogger("hermes_plugins.obol")
 SECRET = "EPHEMERIS_API_KEY"
 LOCAL_REFRESH = 10 * 60          # the seasonal forecast is cheap: recompute this often
 MODEL_REFRESH = HOUR             # local model / Ephemeris: at most hourly, and only after a new hour of data
-FAIL_BACKOFF = 3 * HOUR          # after an Ephemeris failure, stay local this long
+FAIL_BACKOFF = 3 * HOUR
+STEER_PAUSE = 6 * HOUR           # after the provider rejects the cheap model          # after an Ephemeris failure, stay local this long
 
 
 class Obol:
@@ -202,6 +203,9 @@ class Obol:
             return None
         if req.get("model") == b.cheap_model or not self._in_scope(b, kw.get("provider") or ""):
             return None
+        bad = self.store.meta("steer_failed")
+        if bad and bad.get("model") == b.cheap_model and self.clock() - bad["at"] < STEER_PAUSE:
+            return None
         o = self.outlook(b)
         if o is None or o.state not in ("over", "tight", "out"):
             return None
@@ -210,6 +214,18 @@ class Obol:
         self.store.set_meta("last_steer", {"at": self.clock(), "from": req.get("model"), "to": b.cheap_model,
                                            "state": o.state})
         return {"request": new, "source": "obol", "reason": f"budget {o.state}: {_budget.line(o)}"}
+
+    def api_request_error(self, **kw):
+        """If the provider rejects the cheap model right after a steer (not allowed, not found), stop steering
+        to it for a while so every turn doesn't fail; the next attempt goes out on the normal model."""
+        steer = self.store.meta("last_steer")
+        if not steer or self.clock() - steer["at"] > 120:
+            return None
+        if kw.get("status_code") in (400, 401, 403, 404, 422):
+            msg = str((kw.get("error") or {}).get("message") or kw.get("reason") or "")[:200]
+            self.store.set_meta("steer_failed", {"model": steer["to"], "at": self.clock(), "error": msg})
+            log.warning("obol: provider rejected cheap model %s; steering paused", steer["to"])
+        return None
 
     # ── user surface ─────────────────────────────────────────────────────────
     def status(self) -> dict:
@@ -228,6 +244,9 @@ class Obol:
         err = self.store.meta("last_error")
         if err and now - err["at"] < FAIL_BACKOFF:
             out["last_error"] = err
+        bad = self.store.meta("steer_failed")
+        if bad and now - bad["at"] < STEER_PAUSE:
+            out["steer_paused"] = bad
         if steer := self.store.meta("last_steer"):
             out["last_steer"] = steer
         return out
@@ -267,6 +286,7 @@ def register(ctx):
         ctx.register_hook(hook, _safe(_obol.meter))
     ctx.register_hook("pre_llm_call", _safe(_obol.pre_llm_call))
     ctx.register_hook("pre_tool_call", _safe(_obol.pre_tool_call))
+    ctx.register_hook("api_request_error", _safe(_obol.api_request_error))
     ctx.register_middleware("llm_request", _safe(_obol.llm_request))
     ctx.register_command("obol", lambda raw_args="", **_: _commands.run(_obol, raw_args),
                          description="Budget, forecast and run-out time for this agent's spend",

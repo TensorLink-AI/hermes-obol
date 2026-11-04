@@ -107,3 +107,15 @@ def test_meter_then_reprice(make):
     assert o.store.unpriced(0) == 1
     o.cfg["prices"] = {"later/model": [3.0, 3.0]}
     assert o.store.reprice(o.prices.cost) == 1 and o.store.unpriced(0) == 0
+
+
+def test_rejected_cheap_model_pauses_steering(make):
+    o = make({"budget_usd": 1, "period": "week", "mode": "steer", "cheap_model": "openai/gpt-4o-mini"})
+    feed(o, 40, 0.5)
+    req = {"model": "deepseek/deepseek-v4.1-flash"}
+    assert o.llm_request(request=req, provider="openrouter")["request"]["model"] == "openai/gpt-4o-mini"
+    o.api_request_error(status_code=404, error={"message": "No allowed providers"})
+    assert o.llm_request(request=req, provider="openrouter") is None
+    assert "steer paused" in _commands.run(o, "")
+    _commands.run(o, "cheap deepseek/deepseek-v4-flash")
+    assert o.llm_request(request=req, provider="openrouter")["request"]["model"] == "deepseek/deepseek-v4-flash"

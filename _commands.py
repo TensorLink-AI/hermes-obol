@@ -63,6 +63,7 @@ def run(obol, raw_args: str = "") -> str:
             if len(args) < 2:
                 return "Usage: /obol cheap <model id>  (a model on the same provider, e.g. openai/gpt-5-mini)"
             obol._set("cheap_model", args[1])
+            obol.store.set_meta("steer_failed", None)
             return f"Steer will switch to {args[1]}."
         if cmd == "forecaster":
             if len(args) < 2 or args[1] not in ("auto", "ephemeris", "cascade", "seasonal"):
@@ -97,6 +98,8 @@ def _status(obol) -> str:
         lines.append(f"  {s['unpriced_requests']} requests had no price, so spend is a lower bound")
     if st := s.get("last_steer"):
         lines.append(f"  last steer {datetime.fromtimestamp(st['at']):%a %H:%M}: {st['from']} → {st['to']}")
+    if bad := s.get("steer_paused"):
+        lines.append(f"  steer paused: the provider refused {bad['model']} ({bad['error'][:80]})")
     if err := s.get("last_error"):
         lines.append(f"  {err['tier']} unavailable ({err['error'][:80]}); using the local forecast")
     return "\n".join(lines)

@@ -15,6 +15,7 @@ provides_hooks:
   - post_auxiliary_call
   - pre_llm_call
   - pre_tool_call
+  - api_request_error
 provides_middleware:
   - llm_request
 requires_env: []
