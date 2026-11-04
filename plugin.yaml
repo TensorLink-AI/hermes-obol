@@ -1,0 +1,60 @@
+name: obol
+version: 0.1.0
+description: "Forecasts when Hermes will run out of budget and acts first: warns the agent, switches to a cheaper model, or stops at the limit. Forecasts locally with Cascade 4M (no key) or Ephemeris."
+author: TensorLink-AI
+license: Apache-2.0
+homepage: https://github.com/TensorLink-AI/hermes-obol
+manifest_version: 1
+requires_hermes: ">=0.22.0"
+kind: standalone
+tags: [budget, cost, tokens, forecasting, guard]
+provides_tools:
+  - obol_budget
+provides_hooks:
+  - post_api_request
+  - post_auxiliary_call
+  - pre_llm_call
+  - pre_tool_call
+provides_middleware:
+  - llm_request
+requires_env: []
+config_schema:
+  budget_usd:
+    type: float
+    default: 0
+    label: "Budget (USD)"
+    description: "Spend allowed per period; 0 turns budgeting off (metering still runs)"
+  period:
+    type: str
+    choices: [day, week, month]
+    default: week
+    description: "Calendar period in local time (weeks start Monday)"
+  provider:
+    type: str
+    default: ""
+    description: "Count only this provider (e.g. openrouter); empty counts every provider"
+  mode:
+    type: str
+    choices: [watch, steer, guard]
+    default: watch
+    description: "watch: tell the agent when the forecast runs out before the period ends · steer: also route requests to the cheap model · guard: also stop new turns and tools once the budget is used up"
+  cheap_model:
+    type: str
+    default: ""
+    label: "Cheap model"
+    description: "Model id steer switches to, on the same provider (e.g. openai/gpt-5-mini on OpenRouter)"
+  forecaster:
+    type: str
+    choices: [auto, cascade, ephemeris, seasonal]
+    default: auto
+    description: "auto: Ephemeris if a key is saved, else Cascade 4M if installed, else the built-in seasonal forecast"
+  ephemeris_model:
+    type: str
+    default: toto2-313m
+    label: "Ephemeris model"
+    description: "Model for Ephemeris forecasts, or 'route' to let Ephemeris pick"
+  ephemeris_api_key:
+    type: secret
+    env: EPHEMERIS_API_KEY
+    label: "Ephemeris API key"
+    description: "Optional. Get one (free starter credit) at https://ephemeris.cascade.industries/sign-up"
