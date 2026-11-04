@@ -166,7 +166,7 @@ class Obol:
         st = o.state
         if st == "out" and b.mode == "guard":
             return {"action": "block", "message": (
-                f"Obol: the {b.period}ly budget is used up ({_budget.line(o)}). New turns are paused until "
+                f"Obol: the {_budget.ADJ[b.period]} budget is used up ({_budget.line(o)}). New turns are paused until "
                 f"{_budget._when(o.end, self.clock())}. Raise it with /obol budget <usd>, or set /obol mode watch.")}
         # tell the agent once per session each time the outlook gets worse
         rank = {"ok": 0, "unknown": 0, "tight": 1, "over": 2, "out": 3}[st]

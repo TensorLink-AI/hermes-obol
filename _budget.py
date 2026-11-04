@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 HOUR = 3600
 MODES = ("watch", "steer", "guard")
 PERIODS = ("day", "week", "month")
+ADJ = {"day": "daily", "week": "weekly", "month": "monthly"}
 
 
 @dataclass
@@ -129,7 +130,7 @@ def line(o: Outlook, now: float | None = None) -> str:
     if st == "out":
         return f"{head} · budget used up"
     if st == "unknown":
-        return f"{head} · no forecast yet"
+        return f"{head} · first forecast after a full hour of use"
     if st == "over":
         tail = f"out ~{_when(o.out_median, now)}" if o.out_median else "on pace to run out"
         if o.out_high and o.out_high < (o.out_median or o.end):

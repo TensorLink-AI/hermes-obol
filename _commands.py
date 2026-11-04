@@ -86,7 +86,7 @@ def _status(obol) -> str:
     if "state" not in s:
         return f"Obol · {s['line']}"
     lines = [f"Obol · {s['line']}",
-             f"  {b['period']}ly budget{' on ' + b['provider'] if b['provider'] else ''} · mode {b['mode']}"
+             f"  {_budget.ADJ[b['period']]} budget{' on ' + b['provider'] if b['provider'] else ''} · mode {b['mode']}"
              + (f" → {b['cheap_model']}" if b['mode'] == 'steer' and b['cheap_model'] else "")]
     if s.get("forecaster"):
         lines.append(f"  forecast: {s['model']}" + (f" ({s['forecaster_note']})" if s.get("forecaster_note") else ""))
