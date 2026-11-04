@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from . import _budget, _forecast
+from ._pricing import Prices
 from ._store import HOUR, Store
 
 log = logging.getLogger("hermes_plugins.obol")
@@ -26,14 +27,33 @@ FAIL_BACKOFF = 3 * HOUR          # after an Ephemeris failure, stay local this l
 class Obol:
     def __init__(self, ctx=None, data_dir: Path | None = None, get=None, set_=None, secret=None, clock=time.time):
         self.ctx = ctx
-        self.data_dir = Path(data_dir) if data_dir else Path(ctx.state.data_dir)
-        self.store = Store(self.data_dir / "obol.db")
+        self._data_dir = Path(data_dir) if data_dir else None
+        self._store = self._prices = None
         self._get = get or (lambda k, d=None: ctx.get_config(k, d))
         self._set = set_ or (lambda k, v: ctx.set_config(k, v))
         self._secret = secret or _read_secret
         self.clock = clock
         self._lock = threading.Lock()
         self._refreshing = False
+
+    # opened on first use, not in register(): the plugin probe has no profile data directory
+    @property
+    def data_dir(self) -> Path:
+        if self._data_dir is None:
+            self._data_dir = Path(self.ctx.state.data_dir)
+        return self._data_dir
+
+    @property
+    def store(self) -> Store:
+        if self._store is None:
+            self._store = Store(self.data_dir / "obol.db")
+        return self._store
+
+    @property
+    def prices(self) -> Prices:
+        if self._prices is None:
+            self._prices = Prices(self.data_dir, overrides=lambda: self._get("prices", {}) or {})
+        return self._prices
 
     # ── settings ─────────────────────────────────────────────────────────────
     def budget(self) -> _budget.Budget:
@@ -46,7 +66,9 @@ class Obol:
         if not isinstance(usage, dict):
             return
         model = kw.get("response_model") or kw.get("model") or ""
-        cost, status = _price(model, usage, kw.get("provider"), kw.get("base_url"))
+        cost, status = self.prices.cost(model, usage)
+        if self.prices.stale(self.clock()):
+            self.prices.refresh_async(on_done=lambda: self.store.reprice(self.prices.cost))
         self.store.add_call(
             session_id=kw.get("session_id") or "", platform=kw.get("platform") or "",
             provider=kw.get("provider") or "", model=model, aux_task=kw.get("aux_task") or "",
@@ -219,17 +241,6 @@ def _read_secret(name: str) -> str | None:
         return None
 
 
-def _price(model, usage, provider, base_url):
-    """Hermes's own price list (and the provider's reported cost when it gives one)."""
-    try:
-        from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
-        cu = CanonicalUsage(**{k: int(usage.get(k) or 0) for k in (
-            "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")})
-        r = estimate_usage_cost(model, cu, provider=provider, base_url=base_url)
-        return (float(r.amount_usd) if r.amount_usd is not None else None), str(r.status)
-    except Exception as e:
-        log.debug("obol: pricing failed for %s: %s", model, e)
-        return None, "unpriced"
 
 
 # ── registration ─────────────────────────────────────────────────────────────

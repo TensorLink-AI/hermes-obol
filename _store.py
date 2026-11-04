@@ -50,6 +50,20 @@ class Store:
         if self.meta("first_call_at") is None:
             self.set_meta("first_call_at", ts)
 
+    def reprice(self, price) -> int:
+        """Fill in costs for requests that had no price when they were metered. price(model, usage)."""
+        with closing(self._conn()) as c, c:
+            rows = c.execute("SELECT rowid, model, input_tokens, output_tokens, cache_read_tokens, "
+                             "cache_write_tokens FROM calls WHERE cost_usd IS NULL").fetchall()
+            n = 0
+            for rowid, model, i, o, cr, cw in rows:
+                usd, status = price(model, {"input_tokens": i, "output_tokens": o, "cache_read_tokens": cr,
+                                            "cache_write_tokens": cw})
+                if usd is not None:
+                    c.execute("UPDATE calls SET cost_usd=?, cost_status=? WHERE rowid=?", (usd, status, rowid))
+                    n += 1
+        return n
+
     def _scope(self, provider: str):
         return ("AND provider = ?", (provider,)) if provider else ("", ())
 

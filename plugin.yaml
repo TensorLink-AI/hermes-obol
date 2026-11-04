@@ -43,6 +43,10 @@ config_schema:
     default: ""
     label: "Cheap model"
     description: "Model id steer switches to, on the same provider (e.g. openai/gpt-5-mini on OpenRouter)"
+  prices:
+    type: dict
+    default: {}
+    description: "Your own prices, $ per million tokens: {model: [input, output, cache_read]}. Wins over the OpenRouter catalogue"
   forecaster:
     type: str
     choices: [auto, cascade, ephemeris, seasonal]

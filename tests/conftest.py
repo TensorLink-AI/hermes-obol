@@ -35,5 +35,6 @@ def make(tmp_path):
         o = obol_pkg.Obol(data_dir=tmp_path, get=lambda k, d=None: cfg.get(k, d),
                           set_=cfg.__setitem__, secret=lambda n: secret, clock=clock)
         o.cfg, o.clock_obj = cfg, clock
+        o.prices.stale = lambda now=None: False   # tests never fetch the catalogue
         return o
     return make

@@ -88,3 +88,22 @@ def test_hooks_never_raise(make, monkeypatch):
     o = make({"budget_usd": 5})
     monkeypatch.setattr(o, "outlook", lambda *a, **k: 1 / 0)
     assert _plugin._safe(o.pre_llm_call)(session_id="x") is None
+
+
+def test_pricing_overrides_catalogue_and_builtin(make):
+    from obol import _pricing
+    o = make({"prices": {"my/model": [1.0, 2.0]}})
+    assert o.prices.cost("my/model", {"input_tokens": 1_000_000, "output_tokens": 500_000}) == (2.0, "estimated")
+    assert o.prices.cost("anthropic/claude-sonnet-5.5", {"output_tokens": 1_000_000})[0] == 10.0
+    assert o.prices.cost("nobody/knows", {"input_tokens": 5}) == (None, "unpriced")
+    cat = _pricing.parse_catalogue([{"id": "openai/gpt-5-mini", "pricing": {"prompt": "0.00000025", "completion": "0.000002"}},
+                                    {"id": "x/free:free", "pricing": {"prompt": "0", "completion": "0"}}])
+    assert list(cat) == ["gpt-5-mini"] and abs(cat["gpt-5-mini"][0] - 0.25) < 1e-9
+
+
+def test_meter_then_reprice(make):
+    o = make()
+    o.meter(model="later/model", usage={"input_tokens": 1_000_000}, provider="p", session_id="s")
+    assert o.store.unpriced(0) == 1
+    o.cfg["prices"] = {"later/model": [3.0, 3.0]}
+    assert o.store.reprice(o.prices.cost) == 1 and o.store.unpriced(0) == 0
