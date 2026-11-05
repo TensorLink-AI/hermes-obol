@@ -174,8 +174,7 @@ def _status(obol) -> str:
     if bad := s.get("steer_paused"):
         lines.append(f"  not switching for now: the provider refused {bad['model']} ({bad['error'][:80]})")
     if s.get("forecaster") in ("cascade", "seasonal") and not s.get("ephemeris_key"):
-        lines.append("  optional: Ephemeris runs a panel of larger forecasting models (Chronos-2, TimesFM, Toto…);"
-                     " add a key under Settings → Plugins → Obol · ephemeris.cascade.industries")
+        lines.append("  optional: larger hosted forecasting models via Ephemeris (key in Settings → Plugins → Obol)")
     if err := s.get("last_error"):
         lines.append(f"  {err['tier']} unavailable ({err['error'][:80]}); using the local forecast")
     return "\n".join(lines)
@@ -205,6 +204,8 @@ def _no_budget(obol, s) -> str:
         lines.append(f"  a usual {per}: about {_budget._money(u['usual'])}")
         suggest = _nice(max(u["usual"], u.get("expected") or 0) * 1.2)
         lines.append(f"  try: /obol budget {suggest:g} {per}   (20% above that)")
+    elif u.get("expected"):
+        lines.append(f"  try: /obol budget {_nice(u['expected'] * 1.2):g} {per}   (20% above where it's heading)")
     else:
         lines.append(f"  try: /obol budget 20 {per}")
     if lr and lr.get("sessions"):
