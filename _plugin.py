@@ -248,6 +248,7 @@ class Obol:
                        projected_end_median=o.end_median, projected_end_high_pace=o.end_high,
                        runs_out_at=o.out_median, runs_out_at_high_pace=o.out_high,
                        unpriced_requests=self.store.unpriced(o.start, b.provider))
+        out["ephemeris_key"] = bool(self._secret(SECRET))
         f = self.store.meta(f"forecast:{b.provider or '*'}") or {}
         if f.get("note"):
             out["forecaster_note"] = f["note"]

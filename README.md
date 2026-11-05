@@ -26,8 +26,10 @@ The name: an obol was the small coin paid for the crossing that Hermes guided. A
 
 Obol uses the best forecaster this machine can run, and you never need an account:
 
-1. **Ephemeris** (optional, the upgrade): a panel of time-series foundation models over the network. Used only after
-   you save an Ephemeris API key, which is your opt-in.
+1. **Ephemeris** (optional): a hosted panel of larger time-series foundation models (Chronos-2, TimesFM 2.5,
+   Toto 2 and others). Used only after you save an Ephemeris API key, which is your opt-in. Ephemeris is a
+   paid service run by TensorLink, the makers of Obol; new accounts get a small free credit. Without a key,
+   `/obol` shows one line saying it exists. Nothing is ever added to the agent's context about it.
 2. **Cascade 4M** (the default): a 4M-parameter time-series foundation model, bundled with the plugin
    (13 MB) and run in plain numpy on the CPU: no GPU, no torch, no download, no account. A forecast
    takes about 10–50 ms, so it suits a laptop, a mini PC or a Raspberry Pi-class box. It matches the

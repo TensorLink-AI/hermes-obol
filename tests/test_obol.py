@@ -141,3 +141,14 @@ def test_cascade_is_the_default_local_forecaster(make):
     assert f["tier"] == "cascade" and len(f["quantiles"]["0.5"]) == f["horizon"]
     assert all(v >= 0 for v in f["quantiles"]["0.1"])
     assert o.outlook().state in ("ok", "tight", "over")
+
+
+def test_ephemeris_hint_only_in_status_and_only_without_key(make):
+    o = make({"budget_usd": 3, "period": "week"})
+    feed(o, 40, 0.05)
+    assert "optional: Ephemeris" in _commands.run(o, "")
+    told = o.pre_llm_call(session_id="s1") or {}
+    assert "Ephemeris" not in str(told)                 # never pushed into the agent's context
+    o._secret = lambda n: "pc_live_x"
+    o.store.set_meta("ephemeris_failed_at", o.clock())  # stay local, but the key exists
+    assert "optional: Ephemeris" not in _commands.run(o, "")

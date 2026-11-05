@@ -97,6 +97,9 @@ def _status(obol) -> str:
         lines.append(f"  last steer {datetime.fromtimestamp(st['at']):%a %H:%M}: {st['from']} → {st['to']}")
     if bad := s.get("steer_paused"):
         lines.append(f"  steer paused: the provider refused {bad['model']} ({bad['error'][:80]})")
+    if s.get("forecaster") in ("cascade", "seasonal") and not s.get("ephemeris_key"):
+        lines.append("  optional: Ephemeris runs a panel of larger forecasting models (Chronos-2, TimesFM, Toto…);"
+                     " add a key under Settings → Plugins → Obol · ephemeris.cascade.industries")
     if err := s.get("last_error"):
         lines.append(f"  {err['tier']} unavailable ({err['error'][:80]}); using the local forecast")
     return "\n".join(lines)
