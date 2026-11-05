@@ -75,12 +75,12 @@ def test_commands_roundtrip(make):
     assert o.cfg["budget_usd"] == 25 and o.cfg["provider"] == "openrouter"
     assert _commands.run(o, "mode nope").startswith("Usage")
     assert "isn't a number" in _commands.run(o, "budget abc")
-    assert "published yet" in _commands.run(o, "model install")
 
 
 def test_choose_prefers_key_then_local_model(make, tmp_path):
     assert _forecast.choose("auto", True, tmp_path, 100)[0] == "ephemeris"
-    assert _forecast.choose("auto", False, tmp_path, 100)[0] == "seasonal"
+    assert _forecast.choose("auto", False, tmp_path, 100)[0] == "cascade"
+    assert _forecast.choose("seasonal", False, tmp_path, 100)[0] == "seasonal"
     assert _forecast.choose("auto", True, tmp_path, 5)[0] == "seasonal"
 
 
@@ -119,3 +119,25 @@ def test_rejected_cheap_model_pauses_steering(make):
     assert "steer paused" in _commands.run(o, "")
     _commands.run(o, "cheap deepseek/deepseek-v4-flash")
     assert o.llm_request(request=req, provider="openrouter")["request"]["model"] == "deepseek/deepseek-v4-flash"
+
+
+def test_cascade_numpy_matches_torch_reference():
+    import json
+    import numpy as np
+    from pathlib import Path
+    from obol import _cascade
+    m = _cascade.Cascade4M()
+    for case in json.loads((Path(__file__).parent / "cascade_golden.json").read_text()):
+        got = m.quantiles(case["history"], case["horizon"])
+        want = np.array(case["torch_quantiles"])
+        assert got.shape == want.shape
+        assert np.abs(got - want).max() <= 1e-4 * (np.abs(want).max() + 1e-6), case["name"]
+
+
+def test_cascade_is_the_default_local_forecaster(make):
+    o = make({"budget_usd": 3, "period": "week"})
+    feed(o, 40, 0.05)
+    f = o.forecast()
+    assert f["tier"] == "cascade" and len(f["quantiles"]["0.5"]) == f["horizon"]
+    assert all(v >= 0 for v in f["quantiles"]["0.1"])
+    assert o.outlook().state in ("ok", "tight", "over")

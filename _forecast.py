@@ -1,7 +1,7 @@
 """Forecasters for hourly spend, best first, chosen by what this machine has.
 
   ephemeris  Ephemeris API (only when the user has saved a key: that is their opt-in to a network call)
-  cascade    Cascade 4M, a 4M-parameter time-series model run locally with onnxruntime on the CPU
+  cascade    Cascade 4M, a 4M-parameter time-series model bundled with the plugin, run in numpy on the CPU
   seasonal   pure Python: each future hour's range from the same hour of day over the last 7 days
 
 Every forecaster returns {"tier", "model", "made_at", "start", "quantiles": {"0.1": [...], "0.5": [...],
@@ -10,7 +10,6 @@ marginal per-hour quantiles: nominal, not a measured coverage.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import time
@@ -57,82 +56,28 @@ def seasonal(hours, horizon):
             "start": last + HOUR, "quantiles": out}
 
 
-# ── cascade (local ONNX) ─────────────────────────────────────────────────────
+# ── cascade (local, numpy) ───────────────────────────────────────────────────
 
-CASCADE = {
-    # Published from the Cascade 4M checkpoint; pinned by revision and sha256 (set at release).
-    "repo": "TensorLink-AI/cascade-4m-onnx",
-    "revision": "",
-    "file": "cascade-4m.onnx",
-    "sha256": "",
-    "context": 2048,
-}
-
-
-def cascade_path(data_dir: Path) -> Path:
-    return Path(data_dir) / "models" / CASCADE["file"]
-
-
-def cascade_status(data_dir: Path) -> tuple[bool, str]:
-    """(usable, why not). Needs numpy + onnxruntime importable and the verified weights on disk."""
+def cascade_status(data_dir: Path = None) -> tuple[bool, str]:
+    """(usable, why not). Cascade 4M ships with the plugin; it needs only numpy."""
     try:
         import numpy  # noqa: F401
-        import onnxruntime  # noqa: F401
     except Exception:
-        return False, "onnxruntime/numpy not installed on this machine"
-    path = cascade_path(data_dir)
-    if not path.exists():
-        return False, "model not downloaded (/obol model install)"
-    if CASCADE["sha256"] and _sha256(path) != CASCADE["sha256"]:
-        return False, "model file failed its checksum"
+        return False, "numpy isn't installed for Hermes"
+    from . import _cascade
+    if not _cascade.WEIGHTS.exists():
+        return False, "Cascade 4M weights are missing from the plugin"
     return True, ""
 
 
-def _sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def cascade_install(data_dir: Path) -> str:
-    """Download the pinned weights from Hugging Face and verify them. Only ever run on the user's command."""
-    if not CASCADE["revision"] or not CASCADE["sha256"]:
-        return "Cascade 4M weights aren't published yet; Obol is using the seasonal forecaster."
-    url = (f"https://huggingface.co/{CASCADE['repo']}/resolve/{CASCADE['revision']}/{CASCADE['file']}")
-    path = cascade_path(data_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".part")
-    with urllib.request.urlopen(url, timeout=120) as r, open(tmp, "wb") as f:
-        while chunk := r.read(1 << 20):
-            f.write(chunk)
-    if _sha256(tmp) != CASCADE["sha256"]:
-        tmp.unlink(missing_ok=True)
-        return "Download failed its checksum and was deleted."
-    tmp.replace(path)
-    return f"Cascade 4M installed ({path.stat().st_size // 1024} KB), running locally on the CPU."
-
-
-_SESSION = {}
-
-
-def cascade(hours, horizon, data_dir: Path):
-    """Export contract: input "values" float32 [1, L] (raw history, the graph scales it itself),
-    input "horizon" int64 [1]; output "quantiles" float32 [1, 3, horizon] for levels 0.1, 0.5, 0.9."""
-    import numpy as np
-    import onnxruntime as ort
-    path = str(cascade_path(data_dir))
-    if path not in _SESSION:
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 1      # an edge device is also running the agent
-        _SESSION[path] = ort.InferenceSession(path, opts, providers=["CPUExecutionProvider"])
-    values = np.asarray([v for _, v in hours][-CASCADE["context"]:], dtype=np.float32)[None, :]
-    (q,) = _SESSION[path].run(["quantiles"], {"values": values, "horizon": np.asarray([horizon], dtype=np.int64)})
-    q = np.maximum(np.asarray(q)[0], 0.0)
-    q = np.sort(q, axis=0)                 # no crossed bands
+def cascade(hours, horizon, data_dir: Path = None):
+    from . import _cascade
+    q = _cascade.model().quantiles([v for _, v in hours], horizon)
+    q = q.clip(min=0.0)
+    lv = _cascade.model().levels
+    pick = {f"{lv[i]:g}": i for i in range(len(lv))}
     return {"tier": "cascade", "model": "Cascade 4M (local, CPU)", "made_at": time.time(),
-            "start": hours[-1][0] + HOUR, "quantiles": {lv: q[i].tolist() for i, lv in enumerate(LEVELS)}}
+            "start": hours[-1][0] + HOUR, "quantiles": {k: q[:, pick[k]].tolist() for k in LEVELS}}
 
 
 # ── ephemeris (opt-in network) ───────────────────────────────────────────────

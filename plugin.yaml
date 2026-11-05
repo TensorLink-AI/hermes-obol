@@ -1,6 +1,6 @@
 name: obol
 version: 0.1.0
-description: "Forecasts when Hermes will run out of budget and acts first: warns the agent, switches to a cheaper model, or stops at the limit. Forecasts locally with Cascade 4M (no key) or Ephemeris."
+description: "Forecasts when Hermes will run out of budget and acts first: warns the agent, switches to a cheaper model, or stops at the limit. Forecasts on your machine with the bundled Cascade 4M model; Ephemeris optional."
 author: TensorLink-AI
 license: Apache-2.0
 homepage: https://github.com/TensorLink-AI/hermes-obol
@@ -18,6 +18,8 @@ provides_hooks:
   - api_request_error
 provides_middleware:
   - llm_request
+python_dependencies:
+  - "numpy>=1.26,<3"
 requires_env: []
 config_schema:
   budget_usd:
@@ -52,7 +54,7 @@ config_schema:
     type: str
     choices: [auto, cascade, ephemeris, seasonal]
     default: auto
-    description: "auto: Ephemeris if a key is saved, else Cascade 4M if installed, else the built-in seasonal forecast"
+    description: "auto: Cascade 4M on this machine (bundled), or Ephemeris once you save a key; seasonal is the no-numpy fallback"
   ephemeris_model:
     type: str
     default: toto2-313m

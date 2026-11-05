@@ -104,6 +104,15 @@ class Obol:
             return cached
         if current and cached["tier"] == tier and age < 6 * HOUR:
             return cached
+        if tier == "cascade":   # ~50 ms on a CPU: run it here, no thread, no stand-in
+            try:
+                cached = self._stamp(_forecast.cascade(hours, horizon), newest, horizon, note)
+            except Exception as e:
+                self.store.set_meta("last_error", {"tier": tier, "error": str(e)[:200], "at": now})
+                log.warning("obol: cascade forecast failed: %s", e)
+                cached = self._stamp(_forecast.seasonal(hours, horizon), newest, horizon, "cascade failed")
+            self.store.set_meta(key, cached)
+            return cached
         if not current:   # stand in with the seasonal forecast until the model answers
             cached = self._stamp(_forecast.seasonal(hours, horizon), newest, horizon, f"{tier} forecast pending")
             self.store.set_meta(key, cached)
@@ -292,6 +301,6 @@ def register(ctx):
     ctx.register_command("obol", lambda raw_args="", **_: _commands.run(_obol, raw_args),
                          description="Budget, forecast and run-out time for this agent's spend",
                          args_hint="[budget <usd> <day|week|month> | mode <watch|steer|guard> | cheap <model> | "
-                                   "forecast | models | model install]")
+                                   "forecast | models]")
     ctx.register_tool(name="obol_budget", toolset="obol", schema=_commands.TOOL_SCHEMA,
                       handler=lambda args=None, **_: json.dumps(_obol.status(), default=str))

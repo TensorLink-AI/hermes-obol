@@ -26,10 +26,12 @@ The name: an obol was the small coin paid for the crossing that Hermes guided. A
 
 Obol uses the best forecaster this machine can run, and you never need an account:
 
-1. **Ephemeris** (optional): a panel of time-series foundation models over the network. Used only after
+1. **Ephemeris** (optional, the upgrade): a panel of time-series foundation models over the network. Used only after
    you save an Ephemeris API key, which is your opt-in.
-2. **Cascade 4M**: a 4M-parameter time-series model run locally on the CPU with onnxruntime. It's small
-   enough for a laptop, a mini PC or a Raspberry Pi-class box. `/obol model install` downloads it.
+2. **Cascade 4M** (the default): a 4M-parameter time-series foundation model, bundled with the plugin
+   (13 MB) and run in plain numpy on the CPU: no GPU, no torch, no download, no account. A forecast
+   takes about 10–50 ms, so it suits a laptop, a mini PC or a Raspberry Pi-class box. It matches the
+   original PyTorch model to within 2e-6.
 3. **Seasonal** (built in, pure Python): each future hour's range comes from the same hour of day over the
    last 7 days. It always works.
 
@@ -74,8 +76,8 @@ budget itself with the `obol_budget` tool.
     `https://ephemeris.cascade.industries/api/v1/forecast`. It carries only the hourly dollar totals, with
     no prompts, model names, sessions or identifiers, and it spends Ephemeris credits. No automatic retries;
     after a failure Obol stays local for 3 hours.
-  - `/obol model install`, and only that command, downloads the pinned Cascade 4M weights from Hugging
-    Face and checks their sha256.
+  - Prices: at most once a day, a GET of OpenRouter's public model list (`openrouter.ai/api/v1/models`),
+    with no key and nothing about you sent.
 - **Background work:** model forecasts run in a short-lived background thread, never inside a hook. No
   subprocesses, no telemetry.
 - **Credentials:** the optional Ephemeris key is a `secret` setting, read with

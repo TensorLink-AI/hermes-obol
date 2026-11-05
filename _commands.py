@@ -20,7 +20,6 @@ HELP = """/obol                         status and forecast
 /obol cheap <model id>          the cheaper model steer switches to (same provider)
 /obol forecast                  the next hours, hour by hour
 /obol models                    spend by model this period
-/obol model install             download Cascade 4M to forecast locally (no key needed)
 /obol forecaster auto|ephemeris|cascade|seasonal"""
 
 SPARK = "▁▂▃▄▅▆▇█"
@@ -74,8 +73,6 @@ def run(obol, raw_args: str = "") -> str:
             return _hours(obol)
         if cmd == "models":
             return _models(obol)
-        if cmd == "model" and args[1:2] == ["install"]:
-            return _forecast.cascade_install(obol.data_dir)
         return HELP
     except ValueError:
         return "That isn't a number. " + HELP.splitlines()[1]
