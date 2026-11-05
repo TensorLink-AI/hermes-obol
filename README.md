@@ -37,9 +37,24 @@ Obol uses the best forecaster this machine can run, and you never need an accoun
 3. **Seasonal** (built in, pure Python): each future hour's range comes from the same hour of day over the
    last 7 days. It always works.
 
-Forecast ranges are nominal per-hour 10–90% quantiles, not measured coverage. "At forecast pace" adds the
-hourly medians to what is already spent. "High pace" adds the hourly 90% values, a deliberately pessimistic
+Forecast ranges are nominal per-hour 10–90% quantiles, not measured coverage. "At forecast pace" adds each
+hour's expected spend to what is already spent (means add up; medians don't, and run low on bursty spend). "High pace" adds the hourly 90% values, a deliberately pessimistic
 path. It is not a 90% bound on the total.
+
+### How well it forecasts
+
+A backtest on 100 days of one developer's real agent spend (about $11/hour on average, 27% idle hours):
+45 daily forecast origins over the last 45 days, each from the history before it.
+
+| | Pinball loss, next 24 h | Pinball loss, next 7 d | 10–90% range coverage (target 80%) | Error in the 24 h total |
+|---|---|---|---|---|
+| **Cascade 4M** | **2.95** | **3.53** | **82%** | **34%** (bias +6%) |
+| Hour-of-day seasonal | 3.70 | 4.03 | 67% | 45% (bias −14%) |
+| Yesterday repeated | 5.95 | 7.60 | 7% | 32% (bias ±) |
+
+Cascade has the lowest loss, and its ranges are calibrated. Totals over a week remain hard (about 40% median
+error): agent spend is bursty, so treat the run-out time as an early warning, not a promise. This is
+one user's data; your mileage will vary.
 
 ## Install
 

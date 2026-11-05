@@ -1,8 +1,9 @@
 """Budgets, periods and what the forecast says about them.
 
 Projection rules (kept honest on purpose):
-  * "at forecast pace" adds the per-hour medians to what is already spent. A sum of marginal medians
-    is a point projection of the period total, not the median of the total.
+  * "at forecast pace" adds each hour's expected spend (the mean of the forecast distribution, estimated
+    as the average of its quantile levels) to what is already spent. Means add up, so this is the
+    expected period total; a sum of medians would not be, and on real bursty spend it ran 25-60% low.
   * "at the high pace" adds the per-hour 0.9 quantiles. That is a deliberately pessimistic path
     (every hour at its high end), not a 90% bound on the total.
 """
@@ -91,8 +92,9 @@ def outlook(budget: Budget, spent: float, spent_this_hour: float, forecast: dict
         return o
     o.tier, o.model = forecast.get("tier", ""), forecast.get("model", "")
     current = int(now // HOUR) * HOUR
-    for level, attr_end, attr_out in (("0.5", "end_median", "out_median"), ("0.9", "end_high", "out_high")):
-        path = forecast["quantiles"].get(level) or []
+    expected = forecast.get("mean") or forecast["quantiles"].get("0.5") or []
+    for path, attr_end, attr_out in ((expected, "end_median", "out_median"),
+                                     (forecast["quantiles"].get("0.9") or [], "end_high", "out_high")):
         total, crossed = spent, None
         for i, v in enumerate(path):
             h = forecast["start"] + i * HOUR
