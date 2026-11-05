@@ -47,7 +47,8 @@ class Store:
                       (ts, session_id, platform, provider, model, aux_task, int(input_tokens or 0),
                        int(output_tokens or 0), int(cache_read_tokens or 0), int(cache_write_tokens or 0),
                        int(reasoning_tokens or 0), cost_usd, cost_status))
-        if self.meta("first_call_at") is None:
+        first = self.meta("first_call_at")
+        if first is None or ts < float(first):
             self.set_meta("first_call_at", ts)
 
     def reprice(self, price) -> int:

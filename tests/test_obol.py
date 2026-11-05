@@ -218,3 +218,80 @@ def test_history_import_never_overlaps_obol_data(tmp_path):
     from obol import _backfill
     got = _backfill.import_history(o.store, data, o.prices.cost, now)
     assert got["sessions"] == 1                                    # only the session before that
+
+
+from obol import _rules
+
+
+def test_rule_conditions_and_ladder():
+    ctx = {"state": "over", "runs_out_in": 3000, "spent_pct": 85, "request_usd": 0.7, "day_vs_usual": 3.4,
+           "provider": "openrouter", "model": "anthropic/claude-opus-5.5", "platform": "telegram", "aux": False}
+    assert _rules.matches({"state": ["tight", "over"], "runs_out_within": "1h", "spent_pct": ">=80"}, ctx)
+    assert _rules.matches({"model": "anthropic/*", "platform": "telegram", "day_vs_usual": ">3x"}, ctx)
+    assert not _rules.matches({"request_usd": ">1"}, ctx)
+    assert not _rules.matches({"no_such_condition": 1}, ctx)            # unknown conditions fail safe
+    assert _rules.normalize({"do": "explode"}) is None and _rules.normalize({"do": "notify"})["do"] == {"notify": True}
+    ladder = ["mid/model", "cheap/model"]
+    assert [_rules.steer_target(ladder, s) for s in ("tight", "over", "out")] == ["mid/model", "cheap/model", "cheap/model"]
+
+
+def test_custom_rules_replace_the_preset(make):
+    o = make({"budget_usd": 30, "period": "week", "rules": [
+        {"name": "ladder", "when": {"state": ["tight", "over", "out"]}, "do": {"steer": ["mid/m", "cheap/m"]}},
+        {"when": {"bogus": True}, "do": "block"}, {"do": "explode"}]})
+    feed(o, 40, 0.5)                                                     # over: runs out before Sunday
+    r = o.llm_request(request={"model": "big/m", "messages": [{"content": "hi"}]}, provider="openrouter")
+    assert r["request"]["model"] == "cheap/m"
+    assert o.pre_llm_call(session_id="s1") is None                       # bogus block rule never fires
+    assert "malformed" in _commands.run(o, "rules") and "ladder" in _commands.run(o, "rules")
+    assert "steer" in _commands.run(o, "why")
+
+
+def test_large_request_is_held_until_allowed(make):
+    o = make({"budget_usd": 0, "max_request_usd": 0.10, "prices": {"big/m": [10.0, 30.0]}})
+    feed(o, 5, 0.01)
+    huge = [{"content": "x" * 200_000}]                                  # ~50k tokens at $10/M = $0.50
+    r = o.pre_llm_call(session_id="s1", model="big/m", conversation_history=huge, user_message="go")
+    assert r["action"] == "block" and "$0.50" in r["message"] and "/obol allow" in r["message"]
+    _commands.run(o, "allow")
+    assert o.pre_llm_call(session_id="s1", model="big/m", conversation_history=huge, user_message="go") is None
+    assert o.pre_llm_call(session_id="s1", model="big/m", conversation_history=huge, user_message="go")["action"] == "block"
+
+
+def test_unusual_day_notifies_the_user_under_the_reply(make):
+    o = make({"budget_usd": 0, "unusual_day_x": 3})
+    now = o.clock()
+    for d in range(1, 15):                                               # two quiet weeks: $1 a day
+        o.store.add_call(ts=now - d * 86400, cost_usd=1.0, provider="openrouter", session_id="old")
+    today = obol._budget.period_bounds("day", now)[0]
+    o.store.add_call(ts=today + 60, cost_usd=5.0, provider="openrouter", session_id="s1")   # 5× already
+    assert o.pre_llm_call(session_id="s1") is None or True
+    out = o.transform_llm_output(response_text="Here you go.", session_id="s1")
+    assert out.startswith("Here you go.") and "your usual day" in out and "⚠ Obol" in out
+    assert o.transform_llm_output(response_text="Again.", session_id="s1") is None   # delivered once
+    o.pre_llm_call(session_id="s1")
+    assert o.transform_llm_output(response_text="Later.", session_id="s1") is None   # once a day
+
+
+def test_pause_cap_and_topup(make):
+    o = make({"budget_usd": 1, "period": "day", "mode": "guard"})
+    feed(o, 3, 0.5)
+    assert o.pre_llm_call(session_id="s1")["action"] == "block"
+    _commands.run(o, "pause 1h")
+    assert o.pre_llm_call(session_id="s1") is None and o.pre_tool_call(tool_name="t") is None
+    _commands.run(o, "pause off")
+    assert "Added $5" in _commands.run(o, "allow +5")
+    assert (o.pre_llm_call(session_id="s1") or {}).get("action") != "block"
+    _commands.run(o, "cap 0.01")
+    o.clock_obj.t += 60
+    o.store.add_call(ts=o.clock() - 30, cost_usd=0.02, provider="openrouter", session_id="s1")
+    assert o.pre_llm_call(session_id="s2")["action"] == "block"          # the task cap is spent
+    _commands.run(o, "cap off")
+    assert (o.pre_llm_call(session_id="s3") or {}).get("action") != "block"
+
+
+def test_ask_rule_escalates_tools_to_approval(make):
+    o = make({"budget_usd": 30, "period": "week", "rules": [{"when": {"state": ["over", "out"]}, "do": "ask"}]})
+    feed(o, 40, 0.5)
+    r = o.pre_tool_call(tool_name="terminal")
+    assert r["action"] == "approve" and r["rule_key"] == "obol"

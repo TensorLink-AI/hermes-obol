@@ -6,13 +6,14 @@ won't last (steer), or stops new turns and tools once it is used up (guard).
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import threading
 import time
 from pathlib import Path
 
-from . import _backfill, _budget, _forecast
+from . import _backfill, _budget, _forecast, _rules
 from ._pricing import Prices
 from ._store import HOUR, Store
 
@@ -166,81 +167,218 @@ class Obol:
 
         threading.Thread(target=run, name="obol-forecast", daemon=True).start()
 
+    def _topup(self, b, now) -> float:
+        start, _ = _budget.period_bounds(b.period, now)
+        return float(self.store.meta(f"topup:{b.period}:{int(start)}") or 0)
+
     def outlook(self, b: _budget.Budget | None = None) -> _budget.Outlook | None:
         b = b or self.budget()
         if not b.active:
             return None
         now = self.clock()
+        extra = self._topup(b, now)
+        if extra:
+            b = dataclasses.replace(b, usd=b.usd + extra)
         start, _ = _budget.period_bounds(b.period, now)
         spent = self.store.spent(start, now, b.provider)
         this_hour = self.store.spent(int(now // HOUR) * HOUR, now, b.provider)
         return _budget.outlook(b, spent, this_hour, self.forecast(b), now)
 
-    # ── acting ───────────────────────────────────────────────────────────────
+    # ── what the rules see ───────────────────────────────────────────────────
+    def _usual_day(self, provider: str, now: float):
+        """Mean daily spend over the last (up to) 14 full days; None with under 7 days of history."""
+        first = self.store.meta("first_call_at")
+        today, _ = _budget.period_bounds("day", now)
+        if not first or today - float(first) < 7 * 86400:
+            return None
+        days = min(14, int((today - float(first)) // 86400))
+        total = self.store.spent(today - days * 86400, today, provider)
+        return total / days if total > 0 else None
+
+    def _today_expected(self, provider: str, forecast, now: float) -> float:
+        today, tomorrow = _budget.period_bounds("day", now)
+        total = self.store.spent(today, now, provider)
+        if forecast:
+            path = forecast.get("mean") or forecast["quantiles"].get("0.5") or []
+            current = int(now // HOUR) * HOUR
+            this_hour = self.store.spent(current, now, provider)
+            for i, v in enumerate(path):
+                h = forecast["start"] + i * HOUR
+                if v is None or h + HOUR <= now:
+                    continue
+                if h >= tomorrow:
+                    break
+                total += max(0.0, v - this_hour) if h == current else v
+        return total
+
+    def estimate_usd(self, model: str, messages) -> float | None:
+        """Rough input cost of sending `messages` once (about 4 characters a token, no cache discount)."""
+        rate = self.prices.rate(model)
+        if not rate or not messages:
+            return None
+        chars = 0
+        for m in messages if isinstance(messages, list) else [messages]:
+            chars += len(m.get("content") if isinstance(m, dict) and isinstance(m.get("content"), str)
+                         else str(m.get("content") if isinstance(m, dict) else m))
+        return chars / 4 * rate[0] / 1e6
+
+    def context(self, *, session_id="", provider=None, model="", platform="", aux=False, request_usd=None) -> dict:
+        now = self.clock()
+        b = self.budget()
+        provider = self.store.last_provider(session_id) if provider is None else provider
+        ctx = {"provider": provider, "model": model, "platform": platform, "aux": aux, "request_usd": request_usd,
+               "state": "ok", "runs_out_in": None, "spent_pct": None, "day_vs_usual": None, "line": ""}
+        o = self.outlook(b) if b.active and self._in_scope(b, provider) else None
+        if o:
+            ctx.update(state=o.state if o.state != "unknown" else "ok", spent_pct=100 * o.spent / o.usd,
+                       runs_out_in=(o.out_median - now) if o.out_median else None, line=_budget.line(o, now))
+        job = self.store.meta("job_cap")
+        if job:
+            used = self.store.spent(job["since"], now, "")
+            ctx["job"] = {"usd": job["usd"], "spent": used}
+            if used >= job["usd"]:
+                ctx["state"] = "out"
+                ctx["line"] = f"task cap ${job['usd']:g} used up (${used:.2f} since it was set)"
+        usual = self._usual_day(b.provider, now)
+        if usual:
+            today = self._today_expected(b.provider, self.forecast(b), now)
+            ctx.update(day_vs_usual=today / usual, today_expected=today, usual_day=usual)
+        return ctx
+
+    def rules(self) -> list:
+        raw = self._get("rules", []) or []
+        if raw:
+            return [r for r in (_rules.normalize(x) for x in raw) if r]
+        b = self.budget()
+        return [_rules.normalize(r) for r in _rules.presets(
+            b.mode, b.cheap_model, float(self._get("unusual_day_x", 3) or 0),
+            float(self._get("max_request_usd", 0) or 0))]
+
+    def _paused(self) -> bool:
+        return (self.store.meta("paused_until") or 0) > self.clock()
+
+    def _log(self, action: str, rule: str, detail: str) -> None:
+        log_ = self.store.meta("actions") or []
+        log_.append({"at": self.clock(), "action": action, "rule": rule, "detail": detail[:240]})
+        self.store.set_meta("actions", log_[-30:])
+
     def _in_scope(self, b, provider: str) -> bool:
         return not b.provider or not provider or provider == b.provider
 
+    # ── acting ───────────────────────────────────────────────────────────────
     def pre_llm_call(self, **kw):
         self.learn_history()
-        b = self.budget()
-        if not b.active:
+        if self._paused():
             return None
         sid = kw.get("session_id") or ""
-        if not self._in_scope(b, self.store.last_provider(sid)):
+        history = list(kw.get("conversation_history") or []) + [{"content": kw.get("user_message") or ""}]
+        ctx = self.context(session_id=sid, model=kw.get("model") or "", platform=kw.get("platform") or "",
+                           request_usd=self.estimate_usd(kw.get("model") or "", history))
+        acts = _rules.evaluate(self.rules(), ctx)
+        stops = [a for a in acts if a[1] in ("block", "ask")]
+        if stops and self.store.meta("allow_once"):
+            self.store.set_meta("allow_once", None)
+            self._log("allowed", stops[0][0]["name"], "one turn let through by /obol allow")
+            stops = []
+        blocks = [a for a in stops if a[1] == "block"]
+        if blocks:
+            r, _, v = blocks[0]
+            msg = v if isinstance(v, str) else (f"Obol: {ctx['line'] or 'budget used up'}. New turns are paused. "
+                                                "Raise the budget (/obol allow +5), or /obol allow to send one turn.")
+            self._log("block", r["name"], ctx["line"])
+            return {"action": "block", "message": msg if msg.startswith("Obol") else f"Obol: {msg}"}
+        if stops:
+            r, _, v = stops[0]
+            why = (f"this turn would send about ${ctx['request_usd']:.2f} of input"
+                   if ctx.get("request_usd") is not None and "request_usd" in r["when"] else ctx["line"])
+            self._log("ask", r["name"], why)
+            return {"action": "block", "message": f"Obol: {v if isinstance(v, str) else 'check first'}: {why}. "
+                                                  "Send /obol allow to let this one through."}
+        notes, steer_to = [], None
+        for r, action, v in acts:
+            key = f"{r['name']}:{ctx['state']}"
+            if action == "steer" and steer_to is None:
+                steer_to = _rules.steer_target(v, ctx["state"])
+            elif action == "note" and self.store.meta(f"told:{sid}:{key}") is None:
+                self.store.set_meta(f"told:{sid}:{key}", self.clock())
+                text = v if isinstance(v, str) else f"[Obol budget] {ctx['line'] or 'spend is above normal'}."
+                if not isinstance(v, str) and ctx["state"] in ("over", "out"):
+                    text += " Prefer short answers and fewer tool calls; tell the user before starting long work."
+                notes.append(text)
+            elif action == "notify":
+                day = int(_budget.period_bounds("day", self.clock())[0])
+                if self.store.meta(f"notified:{key}:{day}") is None:
+                    self.store.set_meta(f"notified:{key}:{day}", self.clock())
+                    self._queue_notice(sid, v if isinstance(v, str) else self._notice_text(r, ctx))
+        if notes and steer_to:
+            notes.append(f"Requests are being routed to {steer_to} to stretch the budget.")
+        return {"context": " ".join(notes)} if notes else None
+
+    def _notice_text(self, rule, ctx) -> str:
+        if "day_vs_usual" in rule["when"] and ctx.get("day_vs_usual"):
+            return (f"on track for ${ctx['today_expected']:.2f} today, about {ctx['day_vs_usual']:.1f}× your usual "
+                    f"day (${ctx['usual_day']:.2f}).")
+        return ctx["line"] or "budget alert"
+
+    def _queue_notice(self, sid, text) -> None:
+        pending = self.store.meta(f"notice:{sid}") or []
+        pending.append(text)
+        self.store.set_meta(f"notice:{sid}", pending[-3:])
+        self._log("notify", "alert", text)
+
+    def transform_llm_output(self, **kw):
+        """Deliver queued notices to the person: one line under this turn's reply."""
+        sid = kw.get("session_id") or ""
+        pending = self.store.meta(f"notice:{sid}")
+        text = kw.get("response_text")
+        if not pending or not isinstance(text, str):
             return None
-        o = self.outlook(b)
-        if o is None:
-            return None
-        st = o.state
-        if st == "out" and b.mode == "guard":
-            return {"action": "block", "message": (
-                f"Obol: the {_budget.ADJ[b.period]} budget is used up ({_budget.line(o)}). New turns are paused until "
-                f"{_budget._when(o.end, self.clock())}. Raise it with /obol budget <usd>, or set /obol mode watch.")}
-        # tell the agent once per session each time the outlook gets worse
-        rank = {"ok": 0, "unknown": 0, "tight": 1, "over": 2, "out": 3}[st]
-        seen_key = f"told:{sid}"
-        if rank and rank > (self.store.meta(seen_key) or 0):
-            self.store.set_meta(seen_key, rank)
-            note = f"[Obol budget] {_budget.line(o)}."
-            if st in ("over", "out"):
-                note += " Prefer short answers and fewer tool calls; tell the user before starting long work."
-            if b.mode == "steer" and b.cheap_model and st in ("over", "tight", "out"):
-                note += f" Requests are being routed to {b.cheap_model} to stretch the budget."
-            return {"context": note}
-        return None
+        self.store.set_meta(f"notice:{sid}", None)
+        return text + "\n\n" + "\n".join(f"⚠ Obol: {p}" for p in pending)
 
     def pre_tool_call(self, **kw):
-        """Guard mode: a long turn can't keep spending past the limit through its tool loop."""
-        b = self.budget()
-        if not (b.active and b.mode == "guard"):
+        """A long turn can't keep spending past the limit through its tool loop."""
+        if self._paused():
             return None
-        now = self.clock()
-        start, _ = _budget.period_bounds(b.period, now)
-        if self.store.spent(start, now, b.provider) >= b.usd:
+        ctx = self.context(session_id=kw.get("session_id") or "", platform=kw.get("platform") or "")
+        acts = [a for a in _rules.evaluate(self.rules(), ctx) if a[1] in ("block", "ask")]
+        if not acts:
+            return None
+        r, action, v = next((a for a in acts if a[1] == "block"), acts[0])
+        if action == "block":
+            self._log("block tool", r["name"], ctx["line"])
             return {"action": "block", "message": "Obol: budget used up; stop calling tools, summarise what is "
                                                   "done so far and what is left, then end the turn."}
-        return None
+        self._log("ask tool", r["name"], ctx["line"])
+        return {"action": "approve", "rule_key": "obol",
+                "message": f"Obol: {v if isinstance(v, str) else ctx['line'] or 'budget check'}. Run this tool anyway?"}
 
     def llm_request(self, **kw):
-        """Steer mode: when the forecast says the budget won't last, send this request to the cheap model
-        (same provider: only the model id changes)."""
-        b = self.budget()
+        """Steer rules: send this request to a cheaper model on the same provider (only the model id changes)."""
         req = kw.get("request")
-        if not (b.active and b.mode == "steer" and b.cheap_model and isinstance(req, dict) and "model" in req):
+        if self._paused() or not isinstance(req, dict) or "model" not in req:
             return None
-        if req.get("model") == b.cheap_model or not self._in_scope(b, kw.get("provider") or ""):
+        msgs = req.get("messages") or req.get("input")
+        ctx = self.context(provider=kw.get("provider") or "", model=req.get("model") or "",
+                           platform=kw.get("platform") or "", request_usd=self.estimate_usd(req.get("model"), msgs))
+        target = None
+        for r, action, v in _rules.evaluate(self.rules(), ctx):
+            if action == "steer":
+                target, rule = _rules.steer_target(v, ctx["state"]), r
+                break
+        if not target or target == req.get("model"):
             return None
         bad = self.store.meta("steer_failed")
-        if bad and bad.get("model") == b.cheap_model and self.clock() - bad["at"] < STEER_PAUSE:
-            return None
-        o = self.outlook(b)
-        if o is None or o.state not in ("over", "tight", "out"):
+        if bad and bad.get("model") == target and self.clock() - bad["at"] < STEER_PAUSE:
             return None
         new = dict(req)
-        new["model"] = b.cheap_model
-        self.store.set_meta("last_steer", {"at": self.clock(), "from": req.get("model"), "to": b.cheap_model,
-                                           "state": o.state})
-        return {"request": new, "source": "obol", "reason": f"budget {o.state}: {_budget.line(o)}"}
+        new["model"] = target
+        self.store.set_meta("last_steer", {"at": self.clock(), "from": req.get("model"), "to": target,
+                                           "state": ctx["state"]})
+        if (self.store.meta("last_steer_logged") or "") != f"{req.get('model')}>{target}":
+            self.store.set_meta("last_steer_logged", f"{req.get('model')}>{target}")
+            self._log("steer", rule["name"], f"{req.get('model')} → {target} ({ctx['line']})")
+        return {"request": new, "source": "obol", "reason": f"rule '{rule['name']}': {ctx['line']}"}
 
     def api_request_error(self, **kw):
         """If the provider rejects the cheap model right after a steer (not allowed, not found), stop steering
@@ -318,6 +456,7 @@ def register(ctx):
     ctx.register_hook("pre_llm_call", _safe(_obol.pre_llm_call))
     ctx.register_hook("pre_tool_call", _safe(_obol.pre_tool_call))
     ctx.register_hook("api_request_error", _safe(_obol.api_request_error))
+    ctx.register_hook("transform_llm_output", _safe(_obol.transform_llm_output))
     ctx.register_middleware("llm_request", _safe(_obol.llm_request))
     ctx.register_command("obol", lambda raw_args="", **_: _commands.run(_obol, raw_args),
                          description="Budget, forecast and run-out time for this agent's spend",

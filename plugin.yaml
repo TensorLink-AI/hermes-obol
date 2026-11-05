@@ -16,6 +16,7 @@ provides_hooks:
   - pre_llm_call
   - pre_tool_call
   - api_request_error
+  - transform_llm_output
 provides_middleware:
   - llm_request
 python_dependencies:
@@ -50,6 +51,20 @@ config_schema:
     type: dict
     default: {}
     description: "Your own prices, $ per million tokens: {model: [input, output, cache_read]}. Wins over the OpenRouter catalogue"
+  rules:
+    type: list
+    default: []
+    description: "Your own rules, e.g. [{when: {state: over}, do: notify}, {when: {request_usd: '>0.5'}, do: ask}]. Empty uses the mode preset. See /obol rules"
+  unusual_day_x:
+    type: float
+    default: 3
+    label: "Unusual day alert (× usual)"
+    description: "Tell you when today is on track for this many times your usual daily spend; 0 turns it off"
+  max_request_usd:
+    type: float
+    default: 0
+    label: "Hold requests above (USD)"
+    description: "Hold a turn whose input alone would cost more than this until you /obol allow it; 0 turns it off"
   forecaster:
     type: str
     choices: [auto, cascade, ephemeris, seasonal]

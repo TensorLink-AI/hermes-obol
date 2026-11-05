@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from datetime import datetime
 
-from . import _budget, _forecast
+from . import _budget, _forecast, _rules
 
 TOOL_SCHEMA = {
     "name": "obol_budget",
@@ -20,7 +20,13 @@ HELP = """/obol                         status and forecast
 /obol cheap <model id>          the cheaper model steer switches to (same provider)
 /obol forecast                  the next hours, hour by hour
 /obol models                    spend by model this period
-/obol forecaster auto|ephemeris|cascade|seasonal"""
+/obol forecaster auto|ephemeris|cascade|seasonal
+/obol allow +5                  add $5 to this period's budget
+/obol allow                     let the next blocked or held turn through, once
+/obol pause 1h | pause off      stop acting (metering continues) for a while
+/obol cap 2 | cap off           cap this task: from now on, at most $2 more
+/obol rules                     the rules in force (set your own under the `rules` setting)
+/obol why                       what Obol did lately, and why"""
 
 SPARK = "▁▂▃▄▅▆▇█"
 
@@ -69,6 +75,55 @@ def run(obol, raw_args: str = "") -> str:
                 return "Usage: /obol forecaster auto|ephemeris|cascade|seasonal"
             obol._set("forecaster", args[1])
             return f"Forecaster: {args[1]}."
+        if cmd == "allow":
+            if len(args) > 1:
+                amount = float(args[1].lstrip("+$"))
+                b = obol.budget()
+                start, _ = _budget.period_bounds(b.period, obol.clock())
+                key = f"topup:{b.period}:{int(start)}"
+                obol.store.set_meta(key, float(obol.store.meta(key) or 0) + amount)
+                obol._log("top-up", "you", f"+${amount:g} this {b.period}")
+                return f"Added ${amount:g} to this {b.period}'s budget.\n" + _status(obol)
+            obol.store.set_meta("allow_once", obol.clock())
+            return "The next held or blocked turn will go through once."
+        if cmd == "pause":
+            if args[1:2] in (["off"], ["resume"]):
+                obol.store.set_meta("paused_until", None)
+                return "Obol is acting again."
+            secs = _rules.duration(args[1] if len(args) > 1 else "1h")
+            if not secs:
+                return "Usage: /obol pause 30m | 2h | 1d | off"
+            obol.store.set_meta("paused_until", obol.clock() + secs)
+            obol._log("pause", "you", f"for {args[1] if len(args) > 1 else '1h'}")
+            return (f"Paused until {datetime.fromtimestamp(obol.clock() + secs):%a %H:%M}: no notes, steering or "
+                    "blocking. Spend is still metered.")
+        if cmd == "cap":
+            if args[1:2] == ["off"] or len(args) < 2:
+                obol.store.set_meta("job_cap", None)
+                return "Task cap removed."
+            usd = float(args[1].lstrip("$"))
+            obol.store.set_meta("job_cap", {"usd": usd, "since": obol.clock()})
+            obol._log("cap", "you", f"${usd:g} from now")
+            return f"Task cap set: at most ${usd:g} more from now. /obol cap off removes it."
+        if cmd == "rules":
+            lines = ["Rules in force" + (" (your `rules` setting):" if obol._get("rules", []) else
+                                         f" (preset for mode {obol.budget().mode}):")]
+            for r in obol.rules():
+                when = ", ".join(f"{k} {v}" for k, v in r["when"].items()) or "always"
+                do = ", ".join(k if v is True else f"{k} {v}" for k, v in r["do"].items())
+                lines.append(f"  {r['name']}: when {when} → {do}")
+            raw = obol._get("rules", []) or []
+            bad = len(raw) - len(obol.rules()) if raw else 0
+            if bad:
+                lines.append(f"  ({bad} rule(s) in your setting are malformed and ignored)")
+            return "\n".join(lines)
+        if cmd == "why":
+            acts = obol.store.meta("actions") or []
+            if not acts:
+                return "Obol hasn't acted yet."
+            return "\n".join(["What Obol did lately:"] + [
+                f"  {datetime.fromtimestamp(a['at']):%a %H:%M}  {a['action']:<10} ({a['rule']}) {a['detail']}"
+                for a in acts[-12:]])
         if cmd == "forecast":
             return _hours(obol)
         if cmd == "models":
@@ -94,6 +149,11 @@ def _status(obol) -> str:
     hours = obol.store.hourly(provider=b["provider"])[-48:]
     if hours:
         lines.append(f"  last {len(hours)}h  {_spark([v for _, v in hours])}")
+    if (pu := obol.store.meta("paused_until")) and pu > obol.clock():
+        lines.append(f"  paused until {datetime.fromtimestamp(pu):%a %H:%M} (/obol pause off)")
+    if job := obol.store.meta("job_cap"):
+        used = obol.store.spent(job["since"], obol.clock(), "")
+        lines.append(f"  task cap: ${used:.2f} of ${job['usd']:g} since {datetime.fromtimestamp(job['since']):%H:%M}")
     if lr := s.get("learned"):
         lines.append(f"  learned from {lr['sessions']} past Hermes sessions since "
                      f"{datetime.fromtimestamp(lr['since']):%d %b}")
