@@ -89,7 +89,8 @@ class Obol:
             return None
         newest = hours[-1][0]
         horizon = max(1, min(24 * 31, int((_budget.period_bounds(b.period, now)[1] - newest) // HOUR) + 1))
-        tier, note = _forecast.choose(str(self._get("forecaster", "auto") or "auto"), bool(self._secret(SECRET)),
+        key_value = self._secret(SECRET)   # read here: Hermes's secret scope doesn't follow into threads
+        tier, note = _forecast.choose(str(self._get("forecaster", "auto") or "auto"), bool(key_value),
                                       self.data_dir, len(hours))
         if tier == "ephemeris" and (self.store.meta("ephemeris_failed_at") or 0) > now - FAIL_BACKOFF:
             tier, note = _forecast.choose("cascade", False, self.data_dir, len(hours))
@@ -107,14 +108,14 @@ class Obol:
             cached = self._stamp(_forecast.seasonal(hours, horizon), newest, horizon, f"{tier} forecast pending")
             self.store.set_meta(key, cached)
         if now - (self.store.meta(f"model_run:{key}") or 0) >= MODEL_REFRESH or not current:
-            self._refresh_async(key, tier, hours, horizon, newest)
+            self._refresh_async(key, tier, hours, horizon, newest, key_value)
         return cached
 
     def _stamp(self, f, newest, horizon, note=""):
         f.update(data_until=newest, horizon=horizon, note=note)
         return f
 
-    def _refresh_async(self, key, tier, hours, horizon, newest):
+    def _refresh_async(self, key, tier, hours, horizon, newest, api_key=None):
         with self._lock:
             if self._refreshing:
                 return
@@ -124,7 +125,7 @@ class Obol:
         def run():
             try:
                 if tier == "ephemeris":
-                    f = _forecast.ephemeris(hours, horizon, self._secret(SECRET),
+                    f = _forecast.ephemeris(hours, horizon, api_key,
                                             str(self._get("ephemeris_model", "toto2-313m") or ""))
                 else:
                     f = _forecast.cascade(hours, horizon, self.data_dir)

@@ -65,7 +65,9 @@ budget itself with the `obol_budget` tool.
   cost) in `obol.db` in this plugin's data directory under the active profile. Nothing else.
 - **What it changes:** in `guard` mode, `pre_llm_call` refuses new turns and `pre_tool_call` refuses tool
   calls once the budget is used up. In `steer` mode, the `llm_request` middleware replaces only the `model`
-  field of the request with your `cheap_model`. `watch` mode only adds context. Nothing is auto-approved,
+  field of the request with your `cheap_model` (main-loop requests; auxiliary calls such as titles and
+  compression are metered but not steered). If the provider refuses the cheap model, steering to it pauses
+  for 6 hours. `watch` mode only adds context. Nothing is auto-approved,
   and no Hermes code is patched.
 - **Network:** none by default.
   - With an Ephemeris key saved, at most one forecast per hour (only after a new hour of data) goes to
@@ -78,6 +80,8 @@ budget itself with the `obol_budget` tool.
   subprocesses, no telemetry.
 - **Credentials:** the optional Ephemeris key is a `secret` setting, read with
   `agent.secret_scope.get_secret`. Obol never reads `.env`, `auth.json` or any other tool's credentials.
+
+After upgrading Obol, restart Hermes (and its local gateway, `hermes gateway restart`) so the new code loads.
 
 ## Development
 
