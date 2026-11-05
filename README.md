@@ -21,6 +21,33 @@ Obol · $6.20 of $20 this week · ⚠ out ~Fri 14:00 (high pace Thu 21:00)
   last 48h  ▁▁▂▅▇▃▁▁▁▁▂▆█▅▂▁
 ```
 
+## Your own rules
+
+Modes are presets. For full control, set `rules` (Desktop → Settings → Plugins → Obol, or `config.yaml`).
+Rules are plain data, never code:
+
+```yaml
+rules:
+  - name: unusual day
+    when: {day_vs_usual: ">3x"}            # today on track for 3x your usual day
+    do: notify                             # a line under the next reply (CLI, Telegram, Desktop)
+  - when: {state: [tight, over], provider: openrouter}
+    do: {steer: [anthropic/claude-sonnet-5.5, deepseek/deepseek-v4-flash]}   # a ladder: harsher, cheaper
+  - when: {request_usd: ">0.50"}           # this turn's input alone would cost over $0.50
+    do: ask                                # held until you /obol allow it
+  - when: {state: out}
+    do: block
+```
+
+Conditions: `state` (ok, tight, over, out), `runs_out_within` (`2h`), `spent_pct`, `request_usd`,
+`day_vs_usual`, `provider` / `model` / `platform` (globs), `aux`. Actions: `note` (tell the agent),
+`notify` (tell you), `steer`, `ask`, `block`. Unknown conditions never match, and malformed rules are
+ignored and listed by `/obol rules`.
+
+Day to day: `/obol allow +5` tops up this period, `/obol allow` lets one held turn through, `/obol pause 2h`
+stops acting (metering continues), `/obol cap 2` caps the current task at $2 more, and `/obol why` shows
+what Obol did and why.
+
 The name: an obol was the small coin paid for the crossing that Hermes guided. A small coin for a token.
 
 ## Forecasting runs on your machine
