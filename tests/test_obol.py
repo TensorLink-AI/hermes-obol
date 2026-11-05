@@ -1,4 +1,12 @@
 import obol
+
+
+class Clock:
+    def __init__(self, t):
+        self.t = t
+
+    def __call__(self):
+        return self.t
 from obol import _plugin
 from obol import _budget, _forecast, _commands
 from obol._store import HOUR
@@ -159,3 +167,54 @@ def test_money_shows_small_amounts():
     assert _budget._money(0.05) == "$0.05"
     assert _budget._money(0.0001) == "$0.0001"
     assert _budget._money(12.5) == "$12.50" and _budget._money(250) == "$250" and _budget._money(0) == "$0.00"
+
+
+def _fake_state_db(home, now):
+    import sqlite3
+    c = sqlite3.connect(home / "state.db")
+    c.execute("CREATE TABLE sessions (id TEXT, started_at REAL, ended_at REAL, model TEXT, billing_provider TEXT,"
+              " input_tokens INT, output_tokens INT, cache_read_tokens INT, cache_write_tokens INT,"
+              " actual_cost_usd REAL, estimated_cost_usd REAL, content_should_never_be_read TEXT)")
+    c.execute("CREATE TABLE messages (session_id TEXT, role TEXT, timestamp REAL, content TEXT)")
+    for d in range(1, 4):                                  # three past days, two replies 2 h apart each day
+        t0 = now - d * 86400
+        c.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (f"s{d}", t0, t0 + 7200, "deepseek/x", "openrouter", 1000, 100, 0, 0, None, 0.40, "secret"))
+        for k in (0, 2):
+            c.execute("INSERT INTO messages VALUES (?,?,?,?)", (f"s{d}", "assistant", t0 + k * 3600 + 60, "hi"))
+    c.execute("INSERT INTO sessions VALUES ('never-ran', ?, NULL, 'm', NULL, 0, 0, 0, 0, NULL, NULL, '')", (now - 999,))
+    c.commit()
+
+
+def test_learns_past_usage_once_from_hermes_state_db(tmp_path):
+    home = tmp_path / "home"
+    data = home / "plugin-data" / "obol"
+    data.mkdir(parents=True)
+    now = 1_762_340_400.0
+    _fake_state_db(home, now)
+    cfg = {"budget_usd": 5, "period": "week"}
+    o = obol.Obol(data_dir=data, get=lambda k, d=None: cfg.get(k, d), set_=cfg.__setitem__,
+                  secret=lambda n: None, clock=Clock(now))
+    o.prices.stale = lambda now=None: False
+    got = o.learn_history()
+    assert got["sessions"] == 3 and got["requests"] == 6 and abs(got["usd"] - 1.2) < 1e-9
+    hours = o.store.hourly(until=now)
+    assert len(hours) >= 72 and abs(sum(v for _, v in hours) - 1.2) < 1e-9
+    assert sum(1 for _, v in hours if v > 0) == 6                 # cost lands in the hours replies did
+    o.meter(model="deepseek/x", usage={"input_tokens": 10}, provider="openrouter", session_id="new")
+    assert o.learn_history() == got and o.store.meta("history_imported") == got   # only once
+    assert "learned from 3 past Hermes sessions" in _commands.run(o, "")
+
+
+def test_history_import_never_overlaps_obol_data(tmp_path):
+    home = tmp_path / "home"; data = home / "plugin-data" / "obol"; data.mkdir(parents=True)
+    now = 1_762_340_400.0
+    _fake_state_db(home, now)
+    o = obol.Obol(data_dir=data, get=lambda k, d=None: None, set_=lambda k, v: None, secret=lambda n: None,
+                  clock=Clock(now))
+    o.store.set_meta("history_imported", None)
+    o.store.add_call(ts=now - 2 * 86400, cost_usd=1.0)            # Obol was already metering 2 days ago
+    o.store.set_meta("history_imported", None)
+    from obol import _backfill
+    got = _backfill.import_history(o.store, data, o.prices.cost, now)
+    assert got["sessions"] == 1                                    # only the session before that

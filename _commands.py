@@ -82,7 +82,10 @@ def _status(obol) -> str:
     s = obol.status()
     b = s["budget"]
     if "state" not in s:
-        return f"Obol · {s['line']}"
+        lr = s.get("learned")
+        extra = (f"\n  learned from {lr['sessions']} past Hermes sessions; set a budget to see the forecast"
+                 if lr and lr.get("sessions") else "")
+        return f"Obol · {s['line']}{extra}"
     lines = [f"Obol · {s['line']}",
              f"  {_budget.ADJ[b['period']]} budget{' on ' + b['provider'] if b['provider'] else ''} · mode {b['mode']}"
              + (f" → {b['cheap_model']}" if b['mode'] == 'steer' and b['cheap_model'] else "")]
@@ -91,6 +94,9 @@ def _status(obol) -> str:
     hours = obol.store.hourly(provider=b["provider"])[-48:]
     if hours:
         lines.append(f"  last {len(hours)}h  {_spark([v for _, v in hours])}")
+    if lr := s.get("learned"):
+        lines.append(f"  learned from {lr['sessions']} past Hermes sessions since "
+                     f"{datetime.fromtimestamp(lr['since']):%d %b}")
     if s.get("unpriced_requests"):
         lines.append(f"  {s['unpriced_requests']} requests had no price, so spend is a lower bound")
     if st := s.get("last_steer"):

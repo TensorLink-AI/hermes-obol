@@ -2,7 +2,8 @@
 
 **Know when Hermes will run out of budget, and act before it does.**
 
-Every Hermes plugin can count tokens. Obol forecasts them. It meters every provider request, forecasts the
+Every Hermes plugin can count tokens. Obol forecasts them, and it learns your usage from Hermes's own session
+history the moment you install it. It meters every provider request, forecasts the
 rest of the day, week or month hour by hour, and tells you when, at this pace, the budget runs out. Then it
 acts on the forecast, not just on the wall:
 
@@ -80,6 +81,11 @@ budget itself with the `obol_budget` tool.
   `post_api_request` and `post_auxiliary_call` hooks. It never reads prompt or reply text. Cost comes from
   Hermes's own price list (`agent.usage_pricing`). Requests Hermes can't price count as $0 and are reported
   in `/obol`.
+- **Past usage (once):** on first use, Obol reads the active profile's `state.db` read-only to learn how
+  you have used Hermes: each session's time span, model, billing provider, token counts and cost, plus the
+  timestamps of its assistant replies. It never reads message text. Only time before Obol's own first
+  request is imported (up to 90 days), so nothing is counted twice, and forecasts start right away
+  instead of after a day of use.
 - **What it stores:** one row per request (time, session id, platform, provider, model, token counts,
   cost) in `obol.db` in this plugin's data directory under the active profile. Nothing else.
 - **What it changes:** in `guard` mode, `pre_llm_call` refuses new turns and `pre_tool_call` refuses tool

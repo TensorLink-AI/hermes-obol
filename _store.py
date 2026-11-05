@@ -64,6 +64,14 @@ class Store:
                     n += 1
         return n
 
+    def add_calls(self, rows) -> None:
+        """Bulk insert (history import); leaves first_call_at to the caller."""
+        cols = ("ts", "session_id", "platform", "provider", "model", "aux_task", "input_tokens", "output_tokens",
+                "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "cost_usd", "cost_status")
+        with closing(self._conn()) as c, c:
+            c.executemany("INSERT INTO calls VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                          [tuple(r.get(k, 0 if k.endswith("tokens") else "") for k in cols) for r in rows])
+
     def _scope(self, provider: str):
         return ("AND provider = ?", (provider,)) if provider else ("", ())
 

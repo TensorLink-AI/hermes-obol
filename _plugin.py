@@ -12,7 +12,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import _budget, _forecast
+from . import _backfill, _budget, _forecast
 from ._pricing import Prices
 from ._store import HOUR, Store
 
@@ -50,6 +50,21 @@ class Obol:
             self._store = Store(self.data_dir / "obol.db")
         return self._store
 
+    def learn_history(self) -> dict:
+        """Once per profile: import past usage from Hermes's session log so forecasts start right away."""
+        if self.store.meta("history_imported") is not None:
+            return self.store.meta("history_imported")
+        with self._lock:
+            if self.store.meta("history_imported") is not None:
+                return self.store.meta("history_imported")
+            try:
+                got = _backfill.import_history(self.store, self.data_dir, self.prices.cost, self.clock())
+            except Exception as e:
+                log.warning("obol: couldn't read past usage: %s", e)
+                got = {"error": str(e)[:200]}
+            self.store.set_meta("history_imported", got or {"sessions": 0})
+            return got
+
     @property
     def prices(self) -> Prices:
         if self._prices is None:
@@ -66,6 +81,7 @@ class Obol:
         usage = kw.get("usage")
         if not isinstance(usage, dict):
             return
+        self.learn_history()      # before the first row, so history ends where Obol's own data begins
         model = kw.get("response_model") or kw.get("model") or ""
         cost, status = self.prices.cost(model, usage)
         if self.prices.stale(self.clock()):
@@ -165,6 +181,7 @@ class Obol:
         return not b.provider or not provider or provider == b.provider
 
     def pre_llm_call(self, **kw):
+        self.learn_history()
         b = self.budget()
         if not b.active:
             return None
@@ -239,6 +256,7 @@ class Obol:
 
     # ── user surface ─────────────────────────────────────────────────────────
     def status(self) -> dict:
+        learned = self.learn_history()
         b = self.budget()
         now = self.clock()
         o = self.outlook(b)
@@ -249,6 +267,8 @@ class Obol:
                        runs_out_at=o.out_median, runs_out_at_high_pace=o.out_high,
                        unpriced_requests=self.store.unpriced(o.start, b.provider))
         out["ephemeris_key"] = bool(self._secret(SECRET))
+        if learned and learned.get("sessions"):
+            out["learned"] = learned
         f = self.store.meta(f"forecast:{b.provider or '*'}") or {}
         if f.get("note"):
             out["forecaster_note"] = f["note"]
