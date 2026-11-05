@@ -152,3 +152,10 @@ def test_ephemeris_hint_only_in_status_and_only_without_key(make):
     o._secret = lambda n: "pc_live_x"
     o.store.set_meta("ephemeris_failed_at", o.clock())  # stay local, but the key exists
     assert "optional: Ephemeris" not in _commands.run(o, "")
+
+
+def test_money_shows_small_amounts():
+    assert _budget._money(0.0037) == "$0.0037"
+    assert _budget._money(0.05) == "$0.05"
+    assert _budget._money(0.0001) == "$0.0001"
+    assert _budget._money(12.5) == "$12.50" and _budget._money(250) == "$250" and _budget._money(0) == "$0.00"
