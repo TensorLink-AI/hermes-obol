@@ -1,6 +1,6 @@
 name: obol
 version: 0.1.0
-description: "Forecasts when Hermes will run out of budget and acts first: warns the agent, switches to a cheaper model, or stops at the limit. Forecasts on your machine with the bundled Cascade 4M model; Ephemeris optional."
+description: "Forecasts when Hermes will run out of budget and acts first: alerts you, switches to a cheaper model, or stops at the limit. Learns your usage on install and forecasts on your machine with the bundled Cascade 4M model; Ephemeris optional."
 author: TensorLink-AI
 license: Apache-2.0
 homepage: https://github.com/TensorLink-AI/hermes-obol
@@ -27,56 +27,62 @@ config_schema:
     type: float
     default: 0
     label: "Budget (USD)"
-    description: "Spend allowed per period; 0 turns budgeting off (metering still runs)"
+    description: "How much Hermes may spend per period. 0 = no budget: Obol still shows your spend, what's usual and a suggested budget"
   period:
     type: str
     choices: [day, week, month]
     default: week
-    description: "Calendar period in local time (weeks start Monday)"
-  provider:
-    type: str
-    default: ""
-    description: "Count only this provider (e.g. openrouter); empty counts every provider"
+    label: "Per"
+    description: "Calendar day, week (from Monday) or month, in local time"
   mode:
     type: str
-    choices: [watch, steer, guard]
-    default: watch
-    description: "watch: tell the agent when the forecast runs out before the period ends · steer: also route requests to the cheap model · guard: also stop new turns and tools once the budget is used up"
+    choices: [alert, save, stop]
+    default: alert
+    label: "When the budget won't last"
+    description: "alert: tell you and the agent · save: also switch to the cheaper model below · stop: also stop new turns once it's used up"
   cheap_model:
     type: str
     default: ""
-    label: "Cheap model"
-    description: "Model id steer switches to, on the same provider (e.g. openai/gpt-5-mini on OpenRouter)"
-  prices:
-    type: dict
-    default: {}
-    description: "Your own prices, $ per million tokens: {model: [input, output, cache_read]}. Wins over the OpenRouter catalogue"
-  rules:
-    type: list
-    default: []
-    description: "Your own rules, e.g. [{when: {state: over}, do: notify}, {when: {request_usd: '>0.5'}, do: ask}]. Empty uses the mode preset. See /obol rules"
+    label: "Cheaper model"
+    description: "What save mode switches to, on the same provider (e.g. deepseek/deepseek-v4-flash on OpenRouter). Several, comma-separated, make a ladder"
+  provider:
+    type: str
+    default: ""
+    label: "Advanced · count one provider only"
+    description: "e.g. openrouter; empty counts every provider"
   unusual_day_x:
     type: float
     default: 3
-    label: "Unusual day alert (× usual)"
-    description: "Tell you when today is on track for this many times your usual daily spend; 0 turns it off"
+    label: "Advanced · unusual day alert (× usual)"
+    description: "Tell you when today is on track for this many times your usual day; 0 turns it off"
   max_request_usd:
     type: float
     default: 0
-    label: "Hold requests above (USD)"
+    label: "Advanced · hold turns costing more than (USD)"
     description: "Hold a turn whose input alone would cost more than this until you /obol allow it; 0 turns it off"
+  rules:
+    type: list
+    default: []
+    label: "Advanced · your own rules"
+    description: "Replace the mode with your own rules, e.g. [{when: {state: over}, do: notify}]. See the README and /obol rules"
   forecaster:
     type: str
     choices: [auto, cascade, ephemeris, seasonal]
     default: auto
-    description: "auto: Cascade 4M on this machine (bundled), or Ephemeris once you save a key; seasonal is the no-numpy fallback"
-  ephemeris_model:
-    type: str
-    default: toto2-313m
-    label: "Ephemeris model"
-    description: "Model for Ephemeris forecasts, or 'route' to let Ephemeris pick"
+    label: "Advanced · forecaster"
+    description: "auto: Cascade 4M on this machine, or Ephemeris once you save a key"
   ephemeris_api_key:
     type: secret
     env: EPHEMERIS_API_KEY
-    label: "Ephemeris API key"
-    description: "Optional. Get one (free starter credit) at https://ephemeris.cascade.industries/sign-up"
+    label: "Advanced · Ephemeris API key (optional)"
+    description: "Larger hosted forecasting models, a paid service by TensorLink (the makers of Obol). https://ephemeris.cascade.industries/sign-up"
+  ephemeris_model:
+    type: str
+    default: toto2-313m
+    label: "Advanced · Ephemeris model"
+    description: "Model for Ephemeris forecasts, or 'route' to let Ephemeris pick"
+  prices:
+    type: dict
+    default: {}
+    label: "Advanced · your own prices"
+    description: "$ per million tokens, {model: [input, output, cache_read]}; wins over the OpenRouter price list"

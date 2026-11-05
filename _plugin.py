@@ -290,7 +290,7 @@ class Obol:
         if blocks:
             r, _, v = blocks[0]
             msg = v if isinstance(v, str) else (f"Obol: {ctx['line'] or 'budget used up'}. New turns are paused. "
-                                                "Raise the budget (/obol allow +5), or /obol allow to send one turn.")
+                                                "Add to it with /obol topup 5, or /obol allow to send one turn.")
             self._log("block", r["name"], ctx["line"])
             return {"action": "block", "message": msg if msg.startswith("Obol") else f"Obol: {msg}"}
         if stops:
@@ -397,6 +397,24 @@ class Obol:
             self.store.set_meta("steer_failed", {"model": steer["to"], "at": self.clock(), "error": msg})
             log.warning("obol: provider rejected cheap model %s; steering paused", steer["to"])
         return None
+
+    def unbudgeted(self) -> dict:
+        """Before a budget is set: spend this period, a usual period, and where this one is heading."""
+        now = self.clock()
+        b = self.budget()
+        start, end = _budget.period_bounds(b.period, now)
+        spent = self.store.spent(start, now, b.provider)
+        first = self.store.meta("first_call_at")
+        out = {"period": b.period, "spent": spent, "usual": None, "expected": None}
+        if first:
+            days = min(28.0, (start - float(first)) / 86400)
+            if days >= 3:
+                per_day = self.store.spent(start - days * 86400, start, b.provider) / days
+                out["usual"] = per_day * (end - start) / 86400
+        o = _budget.outlook(dataclasses.replace(b, usd=1e12), spent,
+                            self.store.spent(int(now // HOUR) * HOUR, now, b.provider), self.forecast(b), now)
+        out["expected"] = o.end_median
+        return out
 
     # ── user surface ─────────────────────────────────────────────────────────
     def status(self) -> dict:

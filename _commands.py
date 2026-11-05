@@ -13,20 +13,26 @@ TOOL_SCHEMA = {
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
 
-HELP = """/obol                         status and forecast
-/obol budget 20 week [provider] set a budget (day, week or month; provider optional, e.g. openrouter)
-/obol mode watch|steer|guard    watch: tell the agent · steer: also use the cheap model when the forecast
-                                says the budget won't last · guard: also stop new turns once it's used up
-/obol cheap <model id>          the cheaper model steer switches to (same provider)
-/obol forecast                  the next hours, hour by hour
-/obol models                    spend by model this period
-/obol forecaster auto|ephemeris|cascade|seasonal
-/obol allow +5                  add $5 to this period's budget
-/obol allow                     let the next blocked or held turn through, once
-/obol pause 1h | pause off      stop acting (metering continues) for a while
-/obol cap 2 | cap off           cap this task: from now on, at most $2 more
-/obol rules                     the rules in force (set your own under the `rules` setting)
-/obol why                       what Obol did lately, and why"""
+HELP = """/obol                     how you're doing
+/obol budget 20 week      set a limit (day, week or month)
+/obol mode alert|save|stop
+    alert: tell you and the agent when the budget won't last (default)
+    save:  also switch to a cheaper model when it won't last (set it with /obol cheap <model>)
+    stop:  also stop new turns once it's used up
+/obol topup 5             add $5 to this period
+/obol pause 2h            take a break from Obol acting (spend is still recorded)
+/obol more                everything else"""
+
+MORE = """/obol cheap <model>       the cheaper model save mode switches to (same provider)
+/obol allow               let one held or stopped turn through
+/obol cap 2 | cap off     cap the current task at $2 more
+/obol budget 20 week openrouter   count one provider only
+/obol forecast            the next hours, hour by hour
+/obol models              spend by model this period
+/obol why                 what Obol did lately, and why
+/obol rules               the rules in force (write your own in the `rules` setting)
+/obol forecaster auto|cascade|ephemeris|seasonal
+/obol pause off           act again"""
 
 SPARK = "▁▂▃▄▅▆▇█"
 
@@ -45,6 +51,8 @@ def run(obol, raw_args: str = "") -> str:
             return _status(obol)
         if cmd in ("help", "-h", "--help"):
             return HELP
+        if cmd in ("more", "advanced"):
+            return MORE
         if cmd == "budget":
             if len(args) < 2:
                 return "Usage: /obol budget <usd> [day|week|month] [provider]"
@@ -58,25 +66,29 @@ def run(obol, raw_args: str = "") -> str:
                 obol._set("provider", "" if args[3] in ("all", "*") else args[3])
             return "Budget saved.\n" + _status(obol)
         if cmd == "mode":
-            if len(args) < 2 or args[1] not in _budget.MODES:
-                return "Usage: /obol mode watch|steer|guard"
-            obol._set("mode", args[1])
-            b = obol.budget()
-            warn = "" if args[1] != "steer" or b.cheap_model else "\nSet the model to switch to: /obol cheap <model id>"
-            return f"Mode: {args[1]}.{warn}"
+            mode = _budget.LEGACY.get(args[1], args[1]) if len(args) > 1 else ""
+            if mode not in _budget.MODES:
+                return "Usage: /obol mode alert|save|stop\n" + "\n".join(
+                    f"  {m}: {_budget.MODE_HELP[m]}" for m in _budget.MODES)
+            obol._set("mode", mode)
+            warn = ("" if mode != "save" or obol.budget().cheap_model
+                    else "\nTell it which cheaper model to use: /obol cheap <model id>")
+            return f"Mode: {mode}. Obol {_budget.MODE_HELP[mode]}.{warn}"
         if cmd == "cheap":
             if len(args) < 2:
                 return "Usage: /obol cheap <model id>  (a model on the same provider, e.g. openai/gpt-5-mini)"
             obol._set("cheap_model", args[1])
             obol.store.set_meta("steer_failed", None)
-            return f"Steer will switch to {args[1]}."
+            return f"Save mode will switch to {args[1]} when the budget won't last."
         if cmd == "forecaster":
             if len(args) < 2 or args[1] not in ("auto", "ephemeris", "cascade", "seasonal"):
                 return "Usage: /obol forecaster auto|ephemeris|cascade|seasonal"
             obol._set("forecaster", args[1])
             return f"Forecaster: {args[1]}."
-        if cmd == "allow":
-            if len(args) > 1:
+        if cmd == "topup" or (cmd == "allow" and len(args) > 1):
+            if len(args) < 2:
+                return "Usage: /obol topup 5"
+            if True:
                 amount = float(args[1].lstrip("+$"))
                 b = obol.budget()
                 start, _ = _budget.period_bounds(b.period, obol.clock())
@@ -84,6 +96,7 @@ def run(obol, raw_args: str = "") -> str:
                 obol.store.set_meta(key, float(obol.store.meta(key) or 0) + amount)
                 obol._log("top-up", "you", f"+${amount:g} this {b.period}")
                 return f"Added ${amount:g} to this {b.period}'s budget.\n" + _status(obol)
+        if cmd == "allow":
             obol.store.set_meta("allow_once", obol.clock())
             return "The next held or blocked turn will go through once."
         if cmd == "pause":
@@ -95,8 +108,8 @@ def run(obol, raw_args: str = "") -> str:
                 return "Usage: /obol pause 30m | 2h | 1d | off"
             obol.store.set_meta("paused_until", obol.clock() + secs)
             obol._log("pause", "you", f"for {args[1] if len(args) > 1 else '1h'}")
-            return (f"Paused until {datetime.fromtimestamp(obol.clock() + secs):%a %H:%M}: no notes, steering or "
-                    "blocking. Spend is still metered.")
+            return (f"Paused until {datetime.fromtimestamp(obol.clock() + secs):%a %H:%M}: no alerts, model switches "
+                    "or stops. Spend is still recorded. /obol pause off to resume.")
         if cmd == "cap":
             if args[1:2] == ["off"] or len(args) < 2:
                 obol.store.set_meta("job_cap", None)
@@ -128,22 +141,19 @@ def run(obol, raw_args: str = "") -> str:
             return _hours(obol)
         if cmd == "models":
             return _models(obol)
-        return HELP
+        return f"Unknown: /obol {cmd}\n" + HELP
     except ValueError:
-        return "That isn't a number. " + HELP.splitlines()[1]
+        return "That isn't a number, e.g. /obol budget 20 week"
 
 
 def _status(obol) -> str:
     s = obol.status()
     b = s["budget"]
     if "state" not in s:
-        lr = s.get("learned")
-        extra = (f"\n  learned from {lr['sessions']} past Hermes sessions; set a budget to see the forecast"
-                 if lr and lr.get("sessions") else "")
-        return f"Obol · {s['line']}{extra}"
+        return _no_budget(obol, s)
     lines = [f"Obol · {s['line']}",
-             f"  {_budget.ADJ[b['period']]} budget{' on ' + b['provider'] if b['provider'] else ''} · mode {b['mode']}"
-             + (f" → {b['cheap_model']}" if b['mode'] == 'steer' and b['cheap_model'] else "")]
+             f"  {_budget.ADJ[b['period']]} budget{' on ' + b['provider'] if b['provider'] else ''} · {b['mode']} mode"
+             + (f" (switches to {b['cheap_model']})" if b['mode'] == 'save' and b['cheap_model'] else "")]
     if s.get("forecaster"):
         lines.append(f"  forecast: {s['model']}" + (f" ({s['forecaster_note']})" if s.get("forecaster_note") else ""))
     hours = obol.store.hourly(provider=b["provider"])[-48:]
@@ -160,14 +170,45 @@ def _status(obol) -> str:
     if s.get("unpriced_requests"):
         lines.append(f"  {s['unpriced_requests']} requests had no price, so spend is a lower bound")
     if st := s.get("last_steer"):
-        lines.append(f"  last steer {datetime.fromtimestamp(st['at']):%a %H:%M}: {st['from']} → {st['to']}")
+        lines.append(f"  last switch {datetime.fromtimestamp(st['at']):%a %H:%M}: {st['from']} → {st['to']}")
     if bad := s.get("steer_paused"):
-        lines.append(f"  steer paused: the provider refused {bad['model']} ({bad['error'][:80]})")
+        lines.append(f"  not switching for now: the provider refused {bad['model']} ({bad['error'][:80]})")
     if s.get("forecaster") in ("cascade", "seasonal") and not s.get("ephemeris_key"):
         lines.append("  optional: Ephemeris runs a panel of larger forecasting models (Chronos-2, TimesFM, Toto…);"
                      " add a key under Settings → Plugins → Obol · ephemeris.cascade.industries")
     if err := s.get("last_error"):
         lines.append(f"  {err['tier']} unavailable ({err['error'][:80]}); using the local forecast")
+    return "\n".join(lines)
+
+
+def _nice(x: float) -> float:
+    """Round a suggested budget up to a number people would pick."""
+    import math
+    for step in (0.05, 0.1, 0.5, 1, 5, 10, 25, 50, 100):
+        if x <= step * 20:
+            return round(math.ceil(x / step) * step, 2)
+    return float(math.ceil(x / 100) * 100)
+
+
+def _no_budget(obol, s) -> str:
+    """Useful before any setup: what you spend, what's usual, where this week is heading, and a budget to try."""
+    u = obol.unbudgeted()
+    lines = ["Obol · no budget yet"]
+    lr = s.get("learned")
+    if not u.get("spent") and not u.get("usual"):
+        lines.append("  no spend recorded yet: Obol starts learning with your first request")
+        return "\n".join(lines)
+    per = u["period"]
+    lines.append(f"  this {per}: {_budget._money(u['spent'])} so far"
+                 + (f", on track for {_budget._money(u['expected'])}" if u.get("expected") is not None else ""))
+    if u.get("usual"):
+        lines.append(f"  a usual {per}: about {_budget._money(u['usual'])}")
+        suggest = _nice(max(u["usual"], u.get("expected") or 0) * 1.2)
+        lines.append(f"  try: /obol budget {suggest:g} {per}   (20% above that)")
+    else:
+        lines.append(f"  try: /obol budget 20 {per}")
+    if lr and lr.get("sessions"):
+        lines.append(f"  learned from {lr['sessions']} past Hermes sessions")
     return "\n".join(lines)
 
 

@@ -16,7 +16,7 @@ day_vs_usual (">3x"), provider, model, platform (globs allowed), aux (true for b
 Actions: note (tell the agent), notify (tell the user, appended to the next reply), steer (model id, or a
 ladder of them), ask (approval before tools; for a turn, it pauses until `/obol allow`), block.
 Several rules can match; block wins over ask, and steer takes the first matching rule.
-With no `rules` setting, the `mode` setting is a preset of these rules.
+With no `rules` setting, the `mode` setting (alert, save, stop) is a preset of these rules.
 """
 from __future__ import annotations
 
@@ -99,14 +99,14 @@ def presets(mode: str, cheap_model: str, unusual_x: float, max_request_usd: floa
              {"name": "budget alert", "when": {"state": ["over", "out"]}, "do": {"notify": True}}]
     if unusual_x and unusual_x > 0:
         rules.append({"name": "unusual day", "when": {"day_vs_usual": f">{unusual_x:g}x"}, "do": {"notify": True}})
-    if mode in ("steer",) and ladder:
-        rules.append({"name": "steer", "when": {"state": ["tight", "over", "out"], "aux": False},
+    if mode == "save" and ladder:
+        rules.append({"name": "save", "when": {"state": ["tight", "over", "out"], "aux": False},
                       "do": {"steer": ladder if len(ladder) > 1 else ladder[0]}})
     if max_request_usd and max_request_usd > 0:
         rules.append({"name": "large request", "when": {"request_usd": f">{max_request_usd:g}"},
                       "do": {"ask": True}})
-    if mode == "guard":
-        rules.append({"name": "guard", "when": {"state": "out"}, "do": {"block": True}})
+    if mode == "stop":
+        rules.append({"name": "stop", "when": {"state": "out"}, "do": {"block": True}})
     return rules
 
 

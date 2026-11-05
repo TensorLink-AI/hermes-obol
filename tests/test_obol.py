@@ -46,7 +46,7 @@ def test_meter_ignores_missing_usage(make):
 
 
 def test_outlook_runs_out_and_guard_blocks(make):
-    o = make({"budget_usd": 10, "period": "day", "mode": "guard"})
+    o = make({"budget_usd": 10, "period": "day", "mode": "stop"})
     feed(o, 30, 1.0)
     out = o.outlook()
     assert out.state == "out"           # $1/h for the hours since midnight exceeds $10
@@ -56,7 +56,7 @@ def test_outlook_runs_out_and_guard_blocks(make):
 
 
 def test_watch_tells_once_then_stays_quiet(make):
-    o = make({"budget_usd": 200, "period": "week", "mode": "watch"})
+    o = make({"budget_usd": 200, "period": "week", "mode": "alert"})
     feed(o, 40, 2.0)                    # on pace to blow $200 well before Sunday
     first = o.pre_llm_call(session_id="s1")
     assert "context" in first and "Obol budget" in first["context"]
@@ -64,7 +64,7 @@ def test_watch_tells_once_then_stays_quiet(make):
 
 
 def test_steer_swaps_model_only_when_forecast_says_so(make):
-    o = make({"budget_usd": 1000, "period": "week", "mode": "steer", "cheap_model": "cheap/mini"})
+    o = make({"budget_usd": 1000, "period": "week", "mode": "save", "cheap_model": "cheap/mini"})
     feed(o, 40, 0.5)
     req = {"model": "big/model", "messages": []}
     assert o.llm_request(request=req, provider="openrouter") is None     # comfortably inside budget
@@ -118,13 +118,13 @@ def test_meter_then_reprice(make):
 
 
 def test_rejected_cheap_model_pauses_steering(make):
-    o = make({"budget_usd": 1, "period": "week", "mode": "steer", "cheap_model": "openai/gpt-4o-mini"})
+    o = make({"budget_usd": 1, "period": "week", "mode": "save", "cheap_model": "openai/gpt-4o-mini"})
     feed(o, 40, 0.5)
     req = {"model": "deepseek/deepseek-v4.1-flash"}
     assert o.llm_request(request=req, provider="openrouter")["request"]["model"] == "openai/gpt-4o-mini"
     o.api_request_error(status_code=404, error={"message": "No allowed providers"})
     assert o.llm_request(request=req, provider="openrouter") is None
-    assert "steer paused" in _commands.run(o, "")
+    assert "not switching for now" in _commands.run(o, "")
     _commands.run(o, "cheap deepseek/deepseek-v4-flash")
     assert o.llm_request(request=req, provider="openrouter")["request"]["model"] == "deepseek/deepseek-v4-flash"
 
@@ -280,13 +280,13 @@ def test_unusual_day_notifies_the_user_under_the_reply(make):
 
 
 def test_pause_cap_and_topup(make):
-    o = make({"budget_usd": 1, "period": "day", "mode": "guard"})
+    o = make({"budget_usd": 1, "period": "day", "mode": "stop"})
     feed(o, 3, 0.5)
     assert o.pre_llm_call(session_id="s1")["action"] == "block"
     _commands.run(o, "pause 1h")
     assert o.pre_llm_call(session_id="s1") is None and o.pre_tool_call(tool_name="t") is None
     _commands.run(o, "pause off")
-    assert "Added $5" in _commands.run(o, "allow +5")
+    assert "Added $5" in _commands.run(o, "topup 5")
     assert (o.pre_llm_call(session_id="s1") or {}).get("action") != "block"
     _commands.run(o, "cap 0.01")
     o.clock_obj.t += 60
@@ -301,3 +301,32 @@ def test_ask_rule_escalates_tools_to_approval(make):
     feed(o, 40, 0.5)
     r = o.pre_tool_call(tool_name="terminal")
     assert r["action"] == "approve" and r["rule_key"] == "obol"
+
+
+def test_simple_surface_and_legacy_names(make):
+    o = make()
+    assert len(_commands.HELP.splitlines()) <= 10 and "/obol more" in _commands.HELP
+    assert "/obol why" in _commands.run(o, "more")
+    assert "Mode: save" in _commands.run(o, "mode steer")          # old names still work
+    assert o.budget().mode == "save" and "cheaper model" in _commands.run(o, "mode save")
+    o.cfg["mode"] = "guard"
+    assert o.budget().mode == "stop"
+    assert "alert:" in _commands.run(o, "mode nope")
+    assert _commands.run(o, "frobnicate").startswith("Unknown")
+
+
+def test_no_budget_status_suggests_one(make):
+    o = make()
+    now = o.clock()
+    for d in range(1, 22):                                          # three weeks at $2 a day
+        o.store.add_call(ts=now - d * 86400, cost_usd=2.0, provider="openrouter", session_id="old")
+    out = _commands.run(o, "")
+    assert "no budget yet" in out and "a usual week: about $14." in out
+    assert "try: /obol budget 18 week" in out
+
+
+def test_status_is_plain_language(make):
+    o = make({"budget_usd": 30, "period": "week"})
+    feed(o, 40, 0.5)
+    line = _commands.run(o, "").splitlines()[0]
+    assert "on track to run out" in line and "pinball" not in line and "over" not in line

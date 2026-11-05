@@ -7,23 +7,28 @@ history the moment you install it. It meters every provider request, forecasts t
 rest of the day, week or month hour by hour, and tells you when, at this pace, the budget runs out. Then it
 acts on the forecast, not just on the wall:
 
+Pick what happens when the budget won't last:
+
 | Mode | What Obol does |
 |---|---|
-| `watch` | Adds one short note to the agent's context when the outlook gets worse ("on pace to run out ~Thu 15:00"), so it keeps answers short and asks before long work. |
-| `steer` | Also routes requests to a cheaper model on the same provider once the forecast says the budget won't last. It switches early, while there is still budget left. |
-| `guard` | Also stops new turns, and tool calls inside a running turn, once the budget is used up. |
+| `alert` (default) | Tells you, under the agent's reply, and tells the agent, so it keeps answers short and asks before long work. |
+| `save` | Also switches to a cheaper model on the same provider, early, while there is still budget left. |
+| `stop` | Also stops new turns, and tool calls inside a running turn, once the budget is used up. |
 
 ```
 /obol
-Obol · $6.20 of $20 this week · ⚠ out ~Fri 14:00 (high pace Thu 21:00)
-  weekly budget on openrouter · mode steer → openai/gpt-5-mini
+Obol · $6.20 of $20 · ⚠ on track to run out ~Fri 14:00 (if busy, Thu 21:00)
+  weekly budget · save mode (switches to deepseek/deepseek-v4-flash)
   forecast: Cascade 4M (local, CPU)
   last 48h  ▁▁▂▅▇▃▁▁▁▁▂▆█▅▂▁
 ```
 
+With no budget set, `/obol` still shows what you've spent, what a usual week costs you, where this one is
+heading, and a budget to try.
+
 ## Your own rules
 
-Modes are presets. For full control, set `rules` (Desktop → Settings → Plugins → Obol, or `config.yaml`).
+Modes (alert, save, stop) are presets of rules. For full control, set `rules` (Desktop → Settings → Plugins → Obol, or `config.yaml`).
 Rules are plain data, never code:
 
 ```yaml
@@ -44,7 +49,7 @@ Conditions: `state` (ok, tight, over, out), `runs_out_within` (`2h`), `spent_pct
 `notify` (tell you), `steer`, `ask`, `block`. Unknown conditions never match, and malformed rules are
 ignored and listed by `/obol rules`.
 
-Day to day: `/obol allow +5` tops up this period, `/obol allow` lets one held turn through, `/obol pause 2h`
+Day to day: `/obol topup 5` adds to this period, `/obol allow` lets one held turn through, `/obol pause 2h`
 stops acting (metering continues), `/obol cap 2` caps the current task at $2 more, and `/obol why` shows
 what Obol did and why.
 
@@ -94,9 +99,13 @@ hermes plugins enable obol
 Then in any session:
 
 ```
-/obol budget 20 week openrouter
-/obol mode steer
-/obol cheap openai/gpt-5-mini
+/obol                    how you're doing, and a suggested budget
+/obol budget 20 week     set a limit
+/obol mode save          switch to a cheaper model when it won't last
+/obol cheap deepseek/deepseek-v4-flash
+/obol topup 5            add $5 to this period
+/obol pause 2h           take a break from Obol acting
+/obol more               everything else
 ```
 
 Every setting is also on the plugin's page under Desktop → Settings → Plugins. The agent can check the
@@ -115,11 +124,11 @@ budget itself with the `obol_budget` tool.
   instead of after a day of use.
 - **What it stores:** one row per request (time, session id, platform, provider, model, token counts,
   cost) in `obol.db` in this plugin's data directory under the active profile. Nothing else.
-- **What it changes:** in `guard` mode, `pre_llm_call` refuses new turns and `pre_tool_call` refuses tool
-  calls once the budget is used up. In `steer` mode, the `llm_request` middleware replaces only the `model`
+- **What it changes:** in `stop` mode, `pre_llm_call` refuses new turns and `pre_tool_call` refuses tool
+  calls once the budget is used up. In `save` mode, the `llm_request` middleware replaces only the `model`
   field of the request with your `cheap_model` (main-loop requests; auxiliary calls such as titles and
   compression are metered but not steered). If the provider refuses the cheap model, steering to it pauses
-  for 6 hours. `watch` mode only adds context. Nothing is auto-approved,
+  for 6 hours. `alert` mode only adds context and a line under replies. Nothing is auto-approved,
   and no Hermes code is patched.
 - **Network:** none by default.
   - With an Ephemeris key saved, at most one forecast per hour (only after a new hour of data) goes to

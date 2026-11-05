@@ -14,7 +14,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 HOUR = 3600
-MODES = ("watch", "steer", "guard")
+MODES = ("alert", "save", "stop")
+LEGACY = {"watch": "alert", "steer": "save", "guard": "stop"}
+MODE_HELP = {"alert": "tells you and the agent when the budget won't last",
+             "save": "also switches to a cheaper model when the budget won't last",
+             "stop": "also stops new turns once the budget is used up"}
 PERIODS = ("day", "week", "month")
 ADJ = {"day": "daily", "week": "weekly", "month": "monthly"}
 
@@ -24,16 +28,17 @@ class Budget:
     usd: float = 0.0
     period: str = "week"
     provider: str = ""          # "" = all providers
-    mode: str = "watch"         # watch: tell you; steer: also switch to cheap_model; guard: also stop at the limit
+    mode: str = "alert"         # alert: tell you; save: also switch to cheap_model; stop: also stop at the limit
     cheap_model: str = ""
 
     @classmethod
     def from_config(cls, get) -> "Budget":
         b = cls(usd=float(get("budget_usd", 0) or 0), period=str(get("period", "week") or "week"),
-                provider=str(get("provider", "") or ""), mode=str(get("mode", "watch") or "watch"),
+                provider=str(get("provider", "") or ""), mode=str(get("mode", "alert") or "alert"),
                 cheap_model=str(get("cheap_model", "") or ""))
         b.period = b.period if b.period in PERIODS else "week"
-        b.mode = b.mode if b.mode in MODES else "watch"
+        b.mode = LEGACY.get(b.mode, b.mode)
+        b.mode = b.mode if b.mode in MODES else "alert"
         return b
 
     @property
@@ -129,7 +134,7 @@ def _money(x: float) -> str:
 
 
 def line(o: Outlook, now: float | None = None) -> str:
-    """One status line, e.g. `$3.10 of $10 this week · out ~Thu 15:00 (high pace Wed 09:00)`."""
+    """One plain-language status line, e.g. `$3.10 of $10 · on track to run out ~Thu 15:00`."""
     now = time.time() if now is None else now
     head = f"{_money(o.spent)} of {_money(o.usd)}"
     st = o.state
@@ -138,11 +143,11 @@ def line(o: Outlook, now: float | None = None) -> str:
     if st == "unknown":
         return f"{head} · first forecast after a full hour of use"
     if st == "over":
-        tail = f"out ~{_when(o.out_median, now)}" if o.out_median else "on pace to run out"
+        tail = f"on track to run out ~{_when(o.out_median, now)}" if o.out_median else "on track to run out"
         if o.out_high and o.out_high < (o.out_median or o.end):
-            tail += f" (high pace {_when(o.out_high, now)})"
+            tail += f" (if busy, {_when(o.out_high, now)})"
         return f"{head} · ⚠ {tail}"
     if st == "tight":
-        return (f"{head} · on pace for {_money(o.end_median)}; at the high pace out ~{_when(o.out_high, now)}"
-                if o.out_high else f"{head} · tight")
-    return f"{head} · on pace for {_money(o.end_median)} by {_when(o.end, now)}"
+        return (f"{head} · should last, but a busy stretch could use it up by ~{_when(o.out_high, now)}"
+                if o.out_high else f"{head} · should last, just")
+    return f"{head} · on track for {_money(o.end_median)} by {_when(o.end, now)}"
