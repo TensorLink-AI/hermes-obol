@@ -26,7 +26,7 @@ import re
 STATES = ("ok", "tight", "over", "out")
 SEVERITY = {"ok": 0, "unknown": 0, "tight": 1, "over": 2, "out": 3}
 ACTIONS = ("note", "notify", "steer", "ask", "block")
-_CMP = re.compile(r"^\s*(>=|<=|>|<|==|=)?\s*\$?\s*([0-9]*\.?[0-9]+)\s*(x|%)?\s*$")
+_CMP = re.compile(r"^\s*(>=|<=|>|<|==|=)?\s*\$?\s*([0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s*(x|%)?\s*$")
 _DUR = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*(m|min|h|d)?\s*$")
 
 

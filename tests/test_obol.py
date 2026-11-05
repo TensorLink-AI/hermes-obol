@@ -229,6 +229,7 @@ def test_rule_conditions_and_ladder():
     assert _rules.matches({"state": ["tight", "over"], "runs_out_within": "1h", "spent_pct": ">=80"}, ctx)
     assert _rules.matches({"model": "anthropic/*", "platform": "telegram", "day_vs_usual": ">3x"}, ctx)
     assert not _rules.matches({"request_usd": ">1"}, ctx)
+    assert _rules.matches({"request_usd": ">1e-07"}, ctx) and _rules.compare(0.5, "$0.25")
     assert not _rules.matches({"no_such_condition": 1}, ctx)            # unknown conditions fail safe
     assert _rules.normalize({"do": "explode"}) is None and _rules.normalize({"do": "notify"})["do"] == {"notify": True}
     ladder = ["mid/model", "cheap/model"]
