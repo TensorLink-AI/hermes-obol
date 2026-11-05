@@ -116,6 +116,18 @@ class Store:
                             (session_id,)).fetchone()
         return row[0] if row else ""
 
+    def last_prompt_tokens(self, session_id: str = "") -> int:
+        """Prompt size (input + cache) of the latest main-loop request, in this session if it has one."""
+        with closing(self._conn()) as c:
+            for where, args in (("session_id=? AND", (session_id,)), ("", ())):
+                if where and not session_id:
+                    continue
+                row = c.execute(f"SELECT input_tokens + cache_read_tokens + cache_write_tokens FROM calls WHERE {where} "
+                                "aux_task='' ORDER BY ts DESC LIMIT 1", args).fetchone()
+                if row and row[0]:
+                    return int(row[0])
+        return 0
+
     def by_model(self, since: float, provider: str = ""):
         where, args = self._scope(provider)
         with closing(self._conn()) as c:

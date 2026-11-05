@@ -211,16 +211,18 @@ class Obol:
                 total += max(0.0, v - this_hour) if h == current else v
         return total
 
-    def estimate_usd(self, model: str, messages) -> float | None:
-        """Rough input cost of sending `messages` once (about 4 characters a token, no cache discount)."""
-        rate = self.prices.rate(model)
-        if not rate or not messages:
-            return None
+    @staticmethod
+    def _tokens(messages) -> int:
         chars = 0
         for m in messages if isinstance(messages, list) else [messages]:
-            chars += len(m.get("content") if isinstance(m, dict) and isinstance(m.get("content"), str)
-                         else str(m.get("content") if isinstance(m, dict) else m))
-        return chars / 4 * rate[0] / 1e6
+            c = m.get("content") if isinstance(m, dict) else m
+            chars += len(c) if isinstance(c, str) else len(str(c or ""))
+        return chars // 4                                   # about 4 characters a token
+
+    def estimate_usd(self, model: str, tokens: int) -> float | None:
+        """Rough input cost of a prompt of `tokens` tokens (no cache discount, so an upper estimate)."""
+        rate = self.prices.rate(model)
+        return tokens * rate[0] / 1e6 if rate and tokens else None
 
     def context(self, *, session_id="", provider=None, model="", platform="", aux=False, request_usd=None) -> dict:
         now = self.clock()
@@ -271,9 +273,13 @@ class Obol:
         if self._paused():
             return None
         sid = kw.get("session_id") or ""
-        history = list(kw.get("conversation_history") or []) + [{"content": kw.get("user_message") or ""}]
+        # The hook sees the conversation but not the system prompt or tool definitions, so start from the size
+        # of the last real request (which includes them) plus the new message.
+        new_msg = self._tokens([kw.get("user_message") or ""])
+        tokens = max(self.store.last_prompt_tokens(sid) + new_msg, self._tokens(kw.get("conversation_history") or []))
         ctx = self.context(session_id=sid, model=kw.get("model") or "", platform=kw.get("platform") or "",
-                           request_usd=self.estimate_usd(kw.get("model") or "", history))
+                           request_usd=self.estimate_usd(kw.get("model") or "", tokens))
+        ctx["request_tokens"] = tokens
         acts = _rules.evaluate(self.rules(), ctx)
         stops = [a for a in acts if a[1] in ("block", "ask")]
         if stops and self.store.meta("allow_once"):
@@ -289,7 +295,7 @@ class Obol:
             return {"action": "block", "message": msg if msg.startswith("Obol") else f"Obol: {msg}"}
         if stops:
             r, _, v = stops[0]
-            why = (f"this turn would send about ${ctx['request_usd']:.2f} of input"
+            why = (f"this turn would send about {ctx['request_tokens']:,} tokens (~{_budget._money(ctx['request_usd'])})"
                    if ctx.get("request_usd") is not None and "request_usd" in r["when"] else ctx["line"])
             self._log("ask", r["name"], why)
             return {"action": "block", "message": f"Obol: {v if isinstance(v, str) else 'check first'}: {why}. "
@@ -358,9 +364,9 @@ class Obol:
         req = kw.get("request")
         if self._paused() or not isinstance(req, dict) or "model" not in req:
             return None
-        msgs = req.get("messages") or req.get("input")
+        tokens = self._tokens(req.get("messages") or req.get("input") or []) + len(json.dumps(req.get("tools") or [])) // 4
         ctx = self.context(provider=kw.get("provider") or "", model=req.get("model") or "",
-                           platform=kw.get("platform") or "", request_usd=self.estimate_usd(req.get("model"), msgs))
+                           platform=kw.get("platform") or "", request_usd=self.estimate_usd(req.get("model"), tokens))
         target = None
         for r, action, v in _rules.evaluate(self.rules(), ctx):
             if action == "steer":

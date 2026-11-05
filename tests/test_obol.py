@@ -254,6 +254,11 @@ def test_large_request_is_held_until_allowed(make):
     huge = [{"content": "x" * 200_000}]                                  # ~50k tokens at $10/M = $0.50
     r = o.pre_llm_call(session_id="s1", model="big/m", conversation_history=huge, user_message="go")
     assert r["action"] == "block" and "$0.50" in r["message"] and "/obol allow" in r["message"]
+    small = o.pre_llm_call(session_id="s9", model="big/m", conversation_history=[], user_message="hi")
+    assert small is None                                                  # a tiny turn passes
+    o.store.add_call(ts=o.clock() - 5, session_id="s9", model="big/m", input_tokens=20_000, cost_usd=0.2)
+    r = o.pre_llm_call(session_id="s9", model="big/m", conversation_history=[], user_message="hi")
+    assert r["action"] == "block" and "20,000 tokens" in r["message"]     # system prompt + tools counted
     _commands.run(o, "allow")
     assert o.pre_llm_call(session_id="s1", model="big/m", conversation_history=huge, user_message="go") is None
     assert o.pre_llm_call(session_id="s1", model="big/m", conversation_history=huge, user_message="go")["action"] == "block"

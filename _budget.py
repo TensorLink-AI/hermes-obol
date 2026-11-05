@@ -123,9 +123,9 @@ def _when(ts: float, now: float) -> str:
 def _money(x: float) -> str:
     if x >= 100:
         return f"${x:,.0f}"
-    if x >= 1 or x == 0:
+    if x >= 0.01 or x == 0:
         return f"${x:,.2f}"
-    return f"${x:.2g}" if x < 0.01 else f"${x:.3f}".rstrip("0")
+    return f"${x:.2g}"
 
 
 def line(o: Outlook, now: float | None = None) -> str:
