@@ -600,3 +600,25 @@ def test_demo_saves_money_and_touches_nothing_real(make):
     final = float(out.split("save mode: $")[1].rstrip("."))
     assert final < limit < without
     assert (o.store.spent(0, o.clock()), o.cfg) == before
+
+
+def test_switch_holds_until_well_under_budget(make):
+    o = make({"budget_usd": 100, "mode": "save", "cheap_model": "c/mini", "unusual_day_x": 0})
+    feed(o, 3, 0.1)
+
+    def at(expected):
+        o.outlook = lambda b=None: _budget.Outlook(spent=10, usd=100, start=0, end=o.clock() + 9e4, end_median=expected)
+        return o.llm_request(request={"model": "big"}, provider="p", session_id="s") is not None
+    assert not at(80)                # never switched: 80% is fine
+    assert at(90)                    # 85% switches
+    assert at(80) and at(62)         # the switch lowered the forecast: stays
+    assert not at(50)                # well under: back to the usual model
+
+
+def test_demo_doesnt_flip_flop_on_either_forecaster(make, monkeypatch):
+    o = make()
+    for tier in ("cascade", "seasonal"):
+        if tier == "seasonal":
+            monkeypatch.setattr(_forecast, "cascade_status", lambda *a, **k: (False, "no numpy"))
+        out = _commands.run(o, "demo")
+        assert out.count("→") <= 4, out

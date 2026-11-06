@@ -25,6 +25,7 @@ LOCAL_REFRESH = 10 * 60          # the seasonal forecast is cheap: recompute thi
 MODEL_REFRESH = HOUR             # local model / Ephemeris: at most hourly, and only after a new hour of data
 FAIL_BACKOFF = 3 * HOUR          # after a forecaster fails, leave it alone this long
 STEER_PAUSE = 6 * HOUR           # after the provider rejects the cheap model
+STEER_RELEASE = 0.60             # once switched, stay until the expected total is this far under the budget
 ALLOW_FOR = HOUR                 # /obol allow: how long it waits for a turn, and how long that turn's tools run
 # Providers that serve only their own models. Routers (OpenRouter and the like) can serve anything.
 OWN_MODELS = {"anthropic": ("claude",), "openai": ("gpt", "chatgpt", "o1", "o3", "o4"), "deepseek": ("deepseek",),
@@ -310,7 +311,8 @@ class Obol:
             ctx.update(state=o.state if o.state != "unknown" else "ok", spent_pct=100 * o.spent / o.usd if o.usd > 0 else None,
                        runs_out_in=(o.out_median - now) if o.out_median else None,
                        line=f"{self.label(bb)}: {line}" if many else line, budget_provider=bb.provider,
-                       limit={"spent": o.spent, "usd": o.usd, "end": o.end, "period": bb.period, "provider": bb.provider})
+                       limit={"spent": o.spent, "usd": o.usd, "end": o.end, "period": bb.period, "provider": bb.provider,
+                              "expected": o.end_median})
         job = self.store.meta("job_cap")
         if job:
             used = self.store.spent(job["since"], now, "")
@@ -479,10 +481,18 @@ class Obol:
         provider = kw.get("provider") or None
         ctx = self.context(session_id=kw.get("session_id") or "", provider=provider, model=req.get("model") or "",
                            platform=kw.get("platform") or "", request_usd=self.estimate_usd(req.get("model"), tokens))
+        # The switch itself lowers the forecast. Without a gap between switching on (85%) and off, the model would
+        # flip back and forth as the forecast crosses the line.
+        lim = ctx.get("limit")
+        steering = f"steering:{lim['provider'] or '*'}:{int(lim['end'])}" if lim else None
+        seen = ctx
+        if (steering and ctx["state"] == "ok" and self.store.meta(steering)
+                and (lim["expected"] or 0) >= STEER_RELEASE * lim["usd"]):
+            seen = dict(ctx, state="tight")
         target = None
-        for r, action, v in _rules.evaluate(self.rules(), ctx):
+        for r, action, v in _rules.evaluate(self.rules(), seen):
             if action == "steer":
-                target, rule = _rules.steer_target(v, ctx["state"]), r
+                target, rule = _rules.steer_target(v, seen["state"]), r
                 break
         if not target or target == req.get("model"):
             return None
@@ -492,6 +502,8 @@ class Obol:
         if (bad and bad.get("model") == target and bad.get("provider", "") in ("", ctx["provider"])
                 and self.clock() - bad["at"] < STEER_PAUSE):
             return None
+        if steering:
+            self.store.set_meta(steering, self.clock())
         new = dict(req)
         new["model"] = target
         self.store.set_meta("last_steer", {"at": self.clock(), "from": req.get("model"), "to": target,
