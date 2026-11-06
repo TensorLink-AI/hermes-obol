@@ -486,9 +486,11 @@ class Obol:
         lim = ctx.get("limit")
         steering = f"steering:{lim['provider'] or '*'}:{int(lim['end'])}" if lim else None
         seen = ctx
-        if (steering and ctx["state"] == "ok" and self.store.meta(steering)
-                and (lim["expected"] or 0) >= STEER_RELEASE * lim["usd"]):
-            seen = dict(ctx, state="tight")
+        if steering and ctx["state"] == "ok" and self.store.meta(steering):
+            if (lim["expected"] or 0) >= STEER_RELEASE * lim["usd"]:
+                seen = dict(ctx, state="tight")
+            else:
+                self.store.set_meta(steering, None)         # released: it takes 85% to switch again
         target = None
         for r, action, v in _rules.evaluate(self.rules(), seen):
             if action == "steer":

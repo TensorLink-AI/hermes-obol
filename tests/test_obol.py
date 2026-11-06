@@ -613,6 +613,7 @@ def test_switch_holds_until_well_under_budget(make):
     assert at(90)                    # 85% switches
     assert at(80) and at(62)         # the switch lowered the forecast: stays
     assert not at(50)                # well under: back to the usual model
+    assert not at(80)                # and it takes 85% to switch again
 
 
 def test_demo_doesnt_flip_flop_on_either_forecaster(make, monkeypatch):
