@@ -26,6 +26,24 @@ Obol · $6.20 of $20 · ⚠ on track to run out ~Fri 14:00
 With no budget set, `/obol` still shows what you've spent, what a usual week costs you, where this one is
 heading, and a budget to try.
 
+## Several APIs
+
+Obol records every request with its provider, and `/obol providers` forecasts each API on its own usage at
+its own price ($ per million tokens over the last 7 days). That matters when one provider costs 20 times
+another per token:
+
+```
+/obol providers
+By provider, this week (each forecast on its own usage, at its own price):
+  anthropic      $9.80 → $21.40   $2.10/M tok    budget: $9.80 of $15 · ⚠ on track to run out ~Sat 11:00
+  openrouter     $0.48 → $1.10    $0.11/M tok
+/obol budget 15 week anthropic     a budget for one API, beside the main one (0 removes it)
+/obol topup 5 anthropic
+```
+
+Each budget is forecast and acted on separately, and a turn answers to the strictest budget that covers the
+provider it uses.
+
 ## Your own rules
 
 Modes (alert, save, stop) are presets of rules. For full control, set `rules` (Desktop → Settings → Plugins → Obol, or `config.yaml`).

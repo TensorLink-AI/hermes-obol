@@ -45,10 +45,15 @@ config_schema:
     default: ""
     label: "Cheaper model"
     description: "What save mode switches to, on the same provider (e.g. deepseek/deepseek-v4-flash on OpenRouter). Several, comma-separated, make a ladder"
+  budgets:
+    type: list
+    default: []
+    label: "Advanced · budgets per provider"
+    description: "Separate budgets per API, each forecast on its own usage and price, e.g. [{provider: openrouter, usd: 10, period: week}]. /obol budget 10 week openrouter sets one"
   provider:
     type: str
     default: ""
-    label: "Advanced · count one provider only"
+    label: "Advanced · main budget counts one provider only"
     description: "e.g. openrouter; empty counts every provider"
   unusual_day_x:
     type: float

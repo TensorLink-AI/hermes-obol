@@ -122,6 +122,17 @@ class Store:
                             (session_id,)).fetchone()
         return row[0] if row else ""
 
+    def latest_provider(self) -> str:
+        with closing(self._conn()) as c:
+            row = c.execute("SELECT provider FROM calls WHERE aux_task='' AND provider NOT IN ('', 'auto') "
+                            "ORDER BY ts DESC LIMIT 1").fetchone()
+        return row[0] if row else ""
+
+    def providers(self, since: float) -> list:
+        with closing(self._conn()) as c:
+            return [r[0] for r in c.execute("SELECT DISTINCT provider FROM calls WHERE ts>=? AND provider NOT IN "
+                                            "('', 'auto')", (since,))]
+
     def last_prompt_tokens(self, session_id: str = "") -> int:
         """Prompt size (input + cache) of the latest main-loop request, in this session if it has one."""
         with closing(self._conn()) as c:

@@ -26,7 +26,8 @@ HELP = """/obol                     how you're doing
 MORE = """/obol cheap <model>       the cheaper model save mode switches to (same provider)
 /obol allow               let one held or stopped turn through
 /obol cap 2 | cap off     cap the current task at $2 more
-/obol budget 20 week openrouter   count one provider only
+/obol providers           spend, forecast and price per API
+/obol budget 10 week openrouter   a budget for one API (0 removes it); /obol topup 5 openrouter
 /obol forecast            the next hours, hour by hour
 /obol models              spend by model this period
 /obol why                 what Obol did lately, and why
@@ -56,15 +57,20 @@ def run(obol, raw_args: str = "") -> str:
         if cmd == "budget":
             if len(args) < 2:
                 return "Usage: /obol budget <usd> [day|week|month] [provider]"
-            usd = float(args[1].lstrip("$"))
-            obol._set("budget_usd", usd)
-            if len(args) > 2:
-                if args[2] not in _budget.PERIODS:
-                    return f"Period must be one of {', '.join(_budget.PERIODS)}."
-                obol._set("period", args[2])
-            if len(args) > 3:
-                obol._set("provider", "" if args[3] in ("all", "*") else args[3])
-            return "Budget saved.\n" + _status(obol)
+            usd = 0.0 if args[1] in ("off", "none") else float(args[1].lstrip("$"))
+            period = args[2] if len(args) > 2 else None
+            if period and period not in _budget.PERIODS:
+                return f"Period must be one of {', '.join(_budget.PERIODS)}."
+            provider = args[3] if len(args) > 3 and args[3] not in ("all", "*") else ""
+            if provider:                                    # a budget for one API, beside the main one
+                obol.set_provider_budget(provider, usd, period or obol.budget().period)
+                done = f"Budget for {provider} removed." if usd <= 0 else f"Budget for {provider} saved."
+            else:
+                obol._set("budget_usd", usd)
+                if period:
+                    obol._set("period", period)
+                done = "Budget removed." if usd <= 0 else "Budget saved."
+            return done + "\n" + _status(obol)
         if cmd == "mode":
             mode = _budget.LEGACY.get(args[1], args[1]) if len(args) > 1 else ""
             if mode not in _budget.MODES:
@@ -88,14 +94,12 @@ def run(obol, raw_args: str = "") -> str:
         if cmd == "topup" or (cmd == "allow" and len(args) > 1):
             if len(args) < 2:
                 return "Usage: /obol topup 5"
-            if True:
-                amount = float(args[1].lstrip("+$"))
-                b = obol.budget()
-                start, _ = _budget.period_bounds(b.period, obol.clock())
-                key = f"topup:{b.period}:{int(start)}"
-                obol.store.set_meta(key, float(obol.store.meta(key) or 0) + amount)
-                obol._log("top-up", "you", f"+${amount:g} this {b.period}")
-                return f"Added ${amount:g} to this {b.period}'s budget.\n" + _status(obol)
+            amount = float(args[1].lstrip("+$"))
+            provider = args[2] if len(args) > 2 else ""
+            b = obol.topup(amount, provider)
+            if b is None:
+                return f"No budget{' for ' + provider if provider else ''} to top up: /obol budget 20 week"
+            return f"Added ${amount:g} to this {b.period} ({obol.label(b)}).\n" + _status(obol)
         if cmd == "allow":
             obol.store.set_meta("allow_once", obol.clock())
             return "The next held or blocked turn will go through once."
@@ -137,6 +141,8 @@ def run(obol, raw_args: str = "") -> str:
             return "\n".join(["What Obol did lately:"] + [
                 f"  {datetime.fromtimestamp(a['at']):%a %H:%M}  {a['action']:<10} ({a['rule']}) {a['detail']}"
                 for a in acts[-12:]])
+        if cmd in ("providers", "apis"):
+            return _providers(obol)
         if cmd == "forecast":
             return _hours(obol)
         if cmd == "models":
@@ -154,6 +160,9 @@ def _status(obol) -> str:
     lines = [f"Obol · {s['line']}",
              f"  {_budget.ADJ[b['period']]} budget{' on ' + b['provider'] if b['provider'] else ''} · {b['mode']} mode"
              + (f" (switches to {b['cheap_model']})" if b['mode'] == 'save' and b['cheap_model'] else "")]
+    if len(s.get("budgets") or []) > 1:
+        for r in s["budgets"]:
+            lines.append(f"  {r['label']}: {r['line']}")
     if s.get("forecaster"):
         lines.append(f"  forecast: {s['model']}" + (f" ({s['forecaster_note']})" if s.get("forecaster_note") else ""))
     hours = obol.store.hourly(provider=b["provider"])[-48:]
@@ -211,6 +220,21 @@ def _no_budget(obol, s) -> str:
     if lr and lr.get("sessions"):
         lines.append(f"  learned from {lr['sessions']} past Hermes sessions")
     return "\n".join(lines)
+
+
+def _providers(obol) -> str:
+    rows = obol.providers()
+    if not rows:
+        return "No requests in the last 30 days."
+    per = rows[0]["period"]
+    out = [f"By provider, this {per} (each forecast on its own usage, at its own price):"]
+    for r in rows:
+        price = f"${r['usd_per_mtok']:.2f}/M tok" if r["usd_per_mtok"] else "unpriced"
+        exp = f" → {_budget._money(r['expected'])}" if r["expected"] is not None else ""
+        tail = f"   budget: {r['budget']['line']}" if r["budget"] else ""
+        out.append(f"  {r['provider']:<14} {_budget._money(r['spent'])}{exp:<12} {price:<14}{tail}")
+    out.append("  set one: /obol budget 10 week <provider>")
+    return "\n".join(out)
 
 
 def _hours(obol) -> str:

@@ -76,6 +76,43 @@ class Obol:
     def budget(self) -> _budget.Budget:
         return _budget.Budget.from_config(self._get)
 
+    def budgets(self) -> list:
+        """Every active budget: the main one (all providers, or the one named in `provider`) plus one per entry in
+        `budgets` ([{provider, usd, period}]). Mode and cheaper model are shared."""
+        main = self.budget()
+        out = [main] if main.active else []
+        for e in self._get("budgets", []) or []:
+            if not isinstance(e, dict) or not e.get("provider"):
+                continue
+            try:
+                usd = float(e.get("usd") or 0)
+            except (TypeError, ValueError):
+                continue
+            period = e.get("period") if e.get("period") in _budget.PERIODS else "week"
+            if usd > 0:
+                out.append(dataclasses.replace(main, usd=usd, period=period, provider=str(e["provider"])))
+        return out
+
+    def set_provider_budget(self, provider: str, usd: float, period: str) -> None:
+        entries = [e for e in (self._get("budgets", []) or []) if isinstance(e, dict) and e.get("provider") != provider]
+        if usd > 0:
+            entries.append({"provider": provider, "usd": usd, "period": period})
+        self._set("budgets", entries)
+
+    def topup(self, amount: float, provider: str = "") -> _budget.Budget | None:
+        """Add to the current period of the budget for `provider` ("" = the main budget)."""
+        b = next((x for x in self.budgets() if x.provider == provider), None)
+        if b is None:
+            return None
+        start, _ = _budget.period_bounds(b.period, self.clock())
+        key = f"topup:{b.provider or '*'}:{b.period}:{int(start)}"
+        self.store.set_meta(key, float(self.store.meta(key) or 0) + amount)
+        self._log("top-up", "you", f"+${amount:g} this {b.period}" + (f" on {provider}" if provider else ""))
+        return b
+
+    def label(self, b) -> str:
+        return f"{b.provider or 'all providers'}, {_budget.ADJ[b.period]}"
+
     # ── meter ────────────────────────────────────────────────────────────────
     def meter(self, **kw):
         """post_api_request / post_auxiliary_call: record tokens and cost. Never raises, never blocks on network."""
@@ -84,12 +121,15 @@ class Obol:
             return
         self.learn_history()      # before the first row, so history ends where Obol's own data begins
         model = kw.get("response_model") or kw.get("model") or ""
+        provider = kw.get("provider") or ""
+        if provider in ("", "auto"):        # background calls can report "auto": charge them to the real provider
+            provider = self.store.last_provider(kw.get("session_id") or "") or self.store.latest_provider() or provider
         cost, status = self.prices.cost(model, usage)
         if self.prices.stale(self.clock()):
             self.prices.refresh_async(on_done=lambda: self.store.reprice(self.prices.cost))
         self.store.add_call(
             session_id=kw.get("session_id") or "", platform=kw.get("platform") or "",
-            provider=kw.get("provider") or "", model=model, aux_task=kw.get("aux_task") or "",
+            provider=provider, model=model, aux_task=kw.get("aux_task") or "",
             input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"),
             cache_read_tokens=usage.get("cache_read_tokens"), cache_write_tokens=usage.get("cache_write_tokens"),
             reasoning_tokens=usage.get("reasoning_tokens"), cost_usd=cost, cost_status=status)
@@ -98,7 +138,7 @@ class Obol:
     def forecast(self, b: _budget.Budget | None = None) -> dict | None:
         """The cached forecast for the budget's scope, refreshing it when due (models in the background)."""
         b = b or self.budget()
-        key = f"forecast:{b.provider or '*'}"
+        key = f"forecast:{b.provider or '*'}:{b.period}"
         cached = self.store.meta(key)
         now = self.clock()
         hours = self.store.hourly(until=now, provider=b.provider)
@@ -174,7 +214,7 @@ class Obol:
 
     def _topup(self, b, now) -> float:
         start, _ = _budget.period_bounds(b.period, now)
-        return float(self.store.meta(f"topup:{b.period}:{int(start)}") or 0)
+        return float(self.store.meta(f"topup:{b.provider or '*'}:{b.period}:{int(start)}") or 0)
 
     def outlook(self, b: _budget.Budget | None = None) -> _budget.Outlook | None:
         b = b or self.budget()
@@ -235,10 +275,23 @@ class Obol:
         provider = self.store.last_provider(session_id) if provider is None else provider
         ctx = {"provider": provider, "model": model, "platform": platform, "aux": aux, "request_usd": request_usd,
                "state": "ok", "runs_out_in": None, "spent_pct": None, "day_vs_usual": None, "line": ""}
-        o = self.outlook(b) if b.active and self._in_scope(b, provider) else None
-        if o:
+        many = len(self.budgets()) > 1
+        worst = None
+        for bb in self.budgets():
+            if not self._in_scope(bb, provider):
+                continue
+            o = self.outlook(bb)
+            if o is None:
+                continue
+            key = (_rules.SEVERITY.get(o.state, 0), -(o.out_median or float("inf")))
+            if worst is None or key > worst[0]:
+                worst = (key, bb, o)
+        if worst:
+            _, bb, o = worst
+            line = _budget.line(o, now)
             ctx.update(state=o.state if o.state != "unknown" else "ok", spent_pct=100 * o.spent / o.usd,
-                       runs_out_in=(o.out_median - now) if o.out_median else None, line=_budget.line(o, now))
+                       runs_out_in=(o.out_median - now) if o.out_median else None,
+                       line=f"{self.label(bb)}: {line}" if many else line, budget_provider=bb.provider)
         job = self.store.meta("job_cap")
         if job:
             used = self.store.spent(job["since"], now, "")
@@ -403,6 +456,29 @@ class Obol:
             log.warning("obol: provider rejected cheap model %s; steering paused", steer["to"])
         return None
 
+    def providers(self, days: int = 30) -> list:
+        """One row per provider seen lately: spend and expected total this period, its own $/M-token price, and its
+        budget's outlook when it has one. Each provider gets its own token forecast at its own price."""
+        now = self.clock()
+        main = self.budget()
+        period = main.period
+        start, end = _budget.period_bounds(period, now)
+        out = []
+        for prov in self.store.providers(now - days * 86400):
+            b = dataclasses.replace(main, provider=prov, usd=1e12, period=period)
+            spent = self.store.spent(start, now, prov)
+            this_hour = self.store.spent(int(now // HOUR) * HOUR, now, prov)
+            o = _budget.outlook(b, spent, this_hour, self.forecast(b), now)
+            week = now - 7 * 86400
+            tok = sum(v for h, v in self.store.hourly_tokens(until=now, provider=prov) if h >= week)
+            usd7 = self.store.spent(week, now, prov)
+            own = next((x for x in self.budgets() if x.provider == prov), None)
+            ob = self.outlook(own) if own else None
+            out.append({"provider": prov, "spent": spent, "expected": o.end_median, "period": period,
+                        "usd_per_mtok": (usd7 / tok * 1e6) if tok else None,
+                        "budget": own and {"usd": own.usd, "period": own.period, "line": _budget.line(ob, now)}})
+        return sorted(out, key=lambda r: -(r["expected"] or r["spent"]))
+
     def unbudgeted(self) -> dict:
         """Before a budget is set: spend this period, a usual period, and where this one is heading."""
         now = self.clock()
@@ -424,18 +500,25 @@ class Obol:
     # ── user surface ─────────────────────────────────────────────────────────
     def status(self) -> dict:
         learned = self.learn_history()
-        b = self.budget()
         now = self.clock()
-        o = self.outlook(b)
+        rows = []
+        for bb in self.budgets():
+            ob = self.outlook(bb)
+            if ob:
+                rows.append((bb, ob))
+        rows.sort(key=lambda r: (_rules.SEVERITY.get(r[1].state, 0), -(r[1].out_median or float("inf"))), reverse=True)
+        b, o = rows[0] if rows else (self.budget(), None)
         out = {"budget": vars(b), "line": _budget.line(o, now) if o else "no budget set (/obol budget 20 week)"}
         if o:
             out.update(state=o.state, spent=round(o.spent, 4), period_end=o.end, forecaster=o.tier, model=o.model,
                        expected_period_total=o.end_median, runs_out_at=o.out_median,
                        unpriced_requests=self.store.unpriced(o.start, b.provider))
+        out["budgets"] = [{"provider": bb.provider, "period": bb.period, "usd": bb.usd, "state": ob.state,
+                           "label": self.label(bb), "line": _budget.line(ob, now)} for bb, ob in rows]
         out["ephemeris_key"] = bool(self._secret(SECRET))
         if learned and learned.get("sessions"):
             out["learned"] = learned
-        f = self.store.meta(f"forecast:{b.provider or '*'}") or {}
+        f = self.store.meta(f"forecast:{b.provider or '*'}:{b.period}") or {}
         if f.get("note"):
             out["forecaster_note"] = f["note"]
         err = self.store.meta("last_error")

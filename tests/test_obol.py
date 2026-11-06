@@ -79,8 +79,11 @@ def test_steer_swaps_model_only_when_forecast_says_so(make):
 def test_commands_roundtrip(make):
     o = make()
     assert "no budget" in _commands.run(o, "")
-    assert "Budget saved" in _commands.run(o, "budget 25 week openrouter")
-    assert o.cfg["budget_usd"] == 25 and o.cfg["provider"] == "openrouter"
+    assert "Budget saved" in _commands.run(o, "budget 25 week")
+    assert o.cfg["budget_usd"] == 25 and o.cfg["period"] == "week"
+    assert "Budget for openrouter saved" in _commands.run(o, "budget 10 day openrouter")
+    assert o.cfg["budgets"] == [{"provider": "openrouter", "usd": 10.0, "period": "day"}]
+    assert "removed" in _commands.run(o, "budget 0 day openrouter") and o.cfg["budgets"] == []
     assert _commands.run(o, "mode nope").startswith("Usage")
     assert "isn't a number" in _commands.run(o, "budget abc")
 
@@ -331,3 +334,32 @@ def test_status_is_plain_language(make):
     feed(o, 40, 0.5)
     line = _commands.run(o, "").splitlines()[0]
     assert "on track to run out" in line and "pinball" not in line and "over" not in line
+
+
+def test_each_api_forecast_on_its_own_usage_and_price(make):
+    o = make({"budget_usd": 0, "period": "week",
+              "budgets": [{"provider": "openrouter", "usd": 1, "period": "week"},
+                          {"provider": "anthropic", "usd": 100, "period": "week"}]})
+    now = o.clock()
+    for i in range(200, 0, -1):                    # same token volume, 20x price difference
+        o.store.add_call(ts=now - i * HOUR + 60, session_id="a", provider="openrouter", model="cheap",
+                         input_tokens=100_000, cost_usd=0.01)
+        o.store.add_call(ts=now - i * HOUR + 120, session_id="b", provider="anthropic", model="dear",
+                         input_tokens=100_000, cost_usd=0.20)
+    rows = {r["provider"]: r for r in o.providers()}
+    assert abs(rows["openrouter"]["usd_per_mtok"] - 0.10) < 1e-9 and abs(rows["anthropic"]["usd_per_mtok"] - 2.0) < 1e-9
+    assert rows["anthropic"]["expected"] > 10 * rows["openrouter"]["expected"]   # its own price, not a blend
+    assert "openrouter" in _commands.run(o, "providers") and "/M tok" in _commands.run(o, "providers")
+    # the strictest budget that applies decides: openrouter's $1 won't last, anthropic's $100 is fine
+    assert o.context(provider="openrouter")["state"] in ("over", "out")
+    assert o.context(provider="anthropic")["state"] == "ok"
+    st = _commands.run(o, "")
+    assert "openrouter, weekly:" in st and "anthropic, weekly:" in st
+    assert "Added $5" in _commands.run(o, "topup 5 openrouter")
+
+
+def test_background_calls_reporting_auto_count_for_the_real_provider(make):
+    o = make()
+    o.meter(model="m", usage={"input_tokens": 10}, provider="openrouter", session_id="s1")
+    o.meter(model="m", usage={"input_tokens": 10}, provider="auto", session_id="s1", aux_task="title_generation")
+    assert o.store.providers(0) == ["openrouter"]
