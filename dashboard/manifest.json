@@ -1,0 +1,7 @@
+{
+  "name": "obol",
+  "label": "Obol",
+  "description": "Know when you're going to run out of tokens, before it happens.",
+  "version": "0.1.0",
+  "api": "plugin_api.py"
+}

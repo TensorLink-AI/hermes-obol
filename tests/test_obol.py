@@ -1,3 +1,4 @@
+from pathlib import Path
 import pytest
 import obol
 
@@ -11,6 +12,8 @@ class Clock:
 from obol import _plugin
 from obol import _budget, _forecast, _commands
 from obol._store import HOUR
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def feed(o, hours, usd_per_hour, provider="openrouter", session="s1"):
@@ -751,3 +754,53 @@ def test_failed_read_keeps_the_last_good_one(make, monkeypatch):
     monkeypatch.setattr(_limits, "read", lambda p: {"windows": [], "error": "couldn't read it (HTTPStatusError)"})
     rec = o.read_limits("anthropic")
     assert rec["windows"] and rec["error"]
+
+
+# ── Desktop chip ─────────────────────────────────────────────────────────────
+
+def test_snapshot_shows_the_closest_to_running_out(make, monkeypatch):
+    o = make({"budget_usd": 30, "period": "week"})
+    feed(o, 40, 0.5)
+    s = o.desktop_snapshot()
+    assert s["state"] == "over" and s["chip"].startswith("$20.00/$30") and " · out " in s["chip"]
+    assert s["chart"]["limit"] == 30 and s["chart"]["actual"][-1][1] == s["chart"]["expected"][0][1]
+    assert s["chart"]["expected"][-1][1] >= 30
+    _plan(o, monkeypatch, used=100, reset_in=HOUR)
+    s = o.desktop_snapshot()
+    assert s["state"] == "out" and s["chip"] == "Claude current session 100% · used up"
+    assert s["chart"] and len(s["lines"]) == 2
+
+
+def test_snapshot_with_nothing_set_up(make):
+    o = make()
+    s = o.desktop_snapshot()
+    assert s["state"] == "none" and "/obol budget" in s["lines"][0] and "this week" in s["chip"]
+
+
+def test_snapshot_is_written_for_the_backend_and_throttled(make, tmp_path):
+    fastapi = pytest.importorskip("fastapi")
+    assert fastapi
+    import importlib.util
+    import json
+    import sys
+    import types
+    sys.modules.setdefault("hermes_constants", types.SimpleNamespace(get_hermes_home=lambda: tmp_path))
+    spec = importlib.util.spec_from_file_location("obol_api", ROOT / "dashboard" / "plugin_api.py")
+    api = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(api)
+    assert api.snapshot(tmp_path)["state"] == "none"
+
+    o = make({"budget_usd": 30})
+    feed(o, 5, 0.5)
+    o._data_dir = tmp_path / "plugin-data" / "agent-plugin-obol-abc123"
+    o._data_dir.mkdir(parents=True)
+    o.write_desktop()
+    assert api.snapshot(tmp_path)["chip"].startswith("$")
+    (o._data_dir / "desktop.json").write_text("not json")
+    assert api.snapshot(tmp_path)["state"] == "none"
+    o.clock_obj.t += 10
+    o.write_desktop(every=60)
+    assert (o._data_dir / "desktop.json").read_text() == "not json"
+    o.clock_obj.t += 60
+    o.write_desktop(every=60)
+    assert json.loads((o._data_dir / "desktop.json").read_text())["state"]

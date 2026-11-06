@@ -50,6 +50,11 @@ switching would do, priced on your own recent token mix.
 Every setting is also on the plugin's page under Desktop → Settings → Plugins. The agent can check the budget itself
 with the `obol_budget` tool. After upgrading, restart Hermes and its gateway so the new code loads.
 
+## Hermes Desktop
+
+A chip in the status bar shows whichever budget or plan limit is closest to running out, like `$6.20/$20 · out Fri 14:00`.
+Click it for the forecast chart. If a limit is about to go, it also shows a notification.
+
 ## Turning it off
 
 `/obol budget off` removes the limit, `/obol pause 2h` takes a break, `hermes plugins disable obol` turns it off and
@@ -161,6 +166,8 @@ Weekly totals stay hard (about 40% median error) because agent usage is bursty, 
 as an early warning, not a promise. This is one user's data, and it may overlap the model's training data.
 
 ## Disclosure
+
+**Desktop.** The plugin writes a small `desktop.json` to its own data folder with the figures the chip shows. Its backend route, `/api/plugins/obol/status`, only reads that file, and the chip makes no other requests.
 
 **Plan limits.** While you use a Claude or Codex plan, at most every 5 minutes (and when you run `/obol limits`), Obol asks Hermes for that login's limits with `agent.account_usage.fetch_account_usage(read_only=True)`. Hermes makes the request to the vendor with the credential it already holds; Obol never sees the credential, and stores only the window names, percentages and reset times. Turn it off with the `plan_limits` setting.
 

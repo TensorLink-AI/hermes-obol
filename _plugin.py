@@ -152,8 +152,75 @@ class Obol:
             reasoning_tokens=usage.get("reasoning_tokens"), cost_usd=cost, cost_status=status)
         if provider in _limits.PROVIDERS:
             self.read_limits_later(provider)
+        self.write_desktop(every=60)
 
     # ── plan limits (Claude, Codex) ──────────────────────────────────────────
+    def _chart(self, b) -> dict | None:
+        """This period's spend by hour, then where the forecast has it going, both cumulative."""
+        o = self.outlook(b)
+        f = self.forecast(b)
+        if o is None:
+            return None
+        now, total, actual = self.clock(), 0.0, [[o.start, 0.0]]
+        for h, v in self.store.hourly(until=now, provider=b.provider):
+            if h >= o.start:
+                total += v
+                actual.append([h + HOUR, round(total, 4)])
+        actual.append([now, round(o.spent, 4)])
+        expected, total = [[now, round(o.spent, 4)]], o.spent
+        current = int(now // HOUR) * HOUR
+        for i, v in enumerate((f or {}).get("mean") or []):
+            h = f["start"] + i * HOUR
+            if v is None or h + HOUR <= now or h >= o.end:
+                continue
+            total += max(0.0, v - self.store.spent(current, now, b.provider)) if h == current else v
+            expected.append([min(h + HOUR, o.end), round(total, 4)])
+        return {"start": o.start, "end": o.end, "limit": o.usd, "actual": actual[-200:], "expected": expected[:200]}
+
+    def desktop_snapshot(self) -> dict:
+        """What the Desktop chip shows: the budget or plan window closest to running out."""
+        now, when, money = self.clock(), _budget._when, _budget._money
+        rows = []
+        for b in self.budgets():
+            o = self.outlook(b)
+            if o:
+                text = f"{money(o.spent)}/{money(o.usd)}"
+                rows.append({"state": o.state if o.state != "unknown" else "ok", "out": o.out_median, "budget": b,
+                             "chip": text, "line": f"{self.label(b)}: {_budget.line(o, now)}", "model": o.model})
+        for p in _limits.PROVIDERS:
+            for w in self.limit_windows(p):
+                rows.append({"state": w["state"], "out": w["out_at"], "budget": None, "line": w["line"],
+                             "chip": f"{w['name']} {w['used']:.0f}%", "model": ""})
+        rows.sort(key=lambda r: (_rules.SEVERITY.get(r["state"], 0), -(r["out"] or float("inf"))), reverse=True)
+        if not rows:
+            u = self.unbudgeted()
+            return {"state": "none", "chip": f"{money(u['spent'])} this {u['period']}", "at": now,
+                    "lines": [f"No limit set. Try /obol budget 20 {u['period']}"]}
+        top = rows[0]
+        chip = top["chip"]
+        if top["state"] == "out":
+            chip += " · used up"
+        elif top["out"] and top["state"] == "over":
+            chip += f" · out {when(top['out'], now)}"
+        with_budget = next((r for r in rows if r["budget"]), None)
+        return {"state": top["state"], "chip": chip, "at": now, "lines": [r["line"] for r in rows[:4]],
+                "forecast": (with_budget or {}).get("model") or "",
+                "chart": self._chart(with_budget["budget"]) if with_budget else None}
+
+    def write_desktop(self, every: float = 0) -> None:
+        """Leave the chip's data where the Desktop backend can serve it, without opening the ledger itself."""
+        now = self.clock()
+        if every and now - getattr(self, "_desktop_at", 0) < every:
+            return
+        self._desktop_at = now
+        try:
+            path = self.data_dir / "desktop.json"
+            tmp = path.with_suffix(f".{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(self.desktop_snapshot(), default=str))
+            tmp.replace(path)
+        except Exception:
+            log.warning("obol: couldn't write the Desktop snapshot", exc_info=True)
+
     def _limits_on(self) -> bool:
         return str(self._get("plan_limits", "on") or "on") != "off"
 
@@ -793,7 +860,12 @@ def register(ctx):
     ctx.register_hook("api_request_error", _safe(_obol.api_request_error))
     ctx.register_hook("transform_llm_output", _safe(_obol.transform_llm_output))
     ctx.register_middleware("llm_request", _safe(_obol.llm_request))
-    ctx.register_command("obol", lambda raw_args="", **_: _commands.run(_obol, raw_args),
+    def command(raw_args="", **_):
+        out = _commands.run(_obol, raw_args)
+        _obol.write_desktop()            # the chip shouldn't wait for the next request to see a new budget
+        return out
+
+    ctx.register_command("obol", command,
                          description="Know when you'll run out of tokens, before it happens",
                          args_hint="[budget <usd> <day|week|month> | mode <alert|save|stop> | topup <usd> | pause 2h | "
                                    "more]")
