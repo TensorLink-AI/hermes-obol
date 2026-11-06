@@ -151,5 +151,5 @@ def line(o: Outlook, now: float | None = None) -> str:
         tail = f"on track to run out ~{_when(o.out_median, now)}" if o.out_median else "on track to run out"
         return f"{head} · ⚠ {tail}"
     if st == "tight":
-        return f"{head} · should last, just: on track for {_money(o.end_median)} by {_when(o.end, now)}"
+        return f"{head} · close: on track for {_money(o.end_median)} by {_when(o.end, now)}"
     return f"{head} · on track for {_money(o.end_median)} by {_when(o.end, now)}"

@@ -56,7 +56,7 @@ def seasonal(hours, horizon):
         for q in LEVELS:
             out[q].append(max(0.0, _quantile(same, float(q))))
         mean.append(max(0.0, sum(same) / len(same)))
-    return {"tier": "seasonal", "model": "hour-of-day quantiles, last 7 days", "made_at": time.time(),
+    return {"tier": "seasonal", "model": "your usual hours, last 7 days", "made_at": time.time(),
             "start": last + HOUR, "quantiles": out, "mean": mean}
 
 
@@ -128,7 +128,7 @@ def ephemeris(hours, horizon, key: str, model: str = "toto2-313m", timeout: floa
 def choose(setting: str, have_key: bool, data_dir: Path, n_hours: int) -> tuple[str, str]:
     """(tier, note). setting: auto | ephemeris | cascade | seasonal."""
     if n_hours < MIN_HOURS_MODEL and setting in ("auto", "ephemeris", "cascade"):
-        return "seasonal", f"{n_hours}h of history so far; models start at {MIN_HOURS_MODEL}h"
+        return "seasonal", f"the better forecast starts after about {MIN_HOURS_MODEL // 24} days of use"
     if setting in ("auto", "ephemeris") and have_key:
         return "ephemeris", ""
     ok, why = cascade_status(data_dir)

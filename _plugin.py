@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import threading
 import time
 from pathlib import Path
@@ -308,13 +309,15 @@ class Obol:
             line = _budget.line(o, now)
             ctx.update(state=o.state if o.state != "unknown" else "ok", spent_pct=100 * o.spent / o.usd if o.usd > 0 else None,
                        runs_out_in=(o.out_median - now) if o.out_median else None,
-                       line=f"{self.label(bb)}: {line}" if many else line, budget_provider=bb.provider)
+                       line=f"{self.label(bb)}: {line}" if many else line, budget_provider=bb.provider,
+                       limit={"spent": o.spent, "usd": o.usd, "end": o.end, "period": bb.period, "provider": bb.provider})
         job = self.store.meta("job_cap")
         if job:
             used = self.store.spent(job["since"], now, "")
             ctx["job"] = {"usd": job["usd"], "spent": used}
             if used >= job["usd"]:
                 ctx["state"] = "out"
+                ctx["limit"] = None
                 ctx["line"] = f"task cap ${job['usd']:g} used up (${used:.2f} since it was set)"
         usual = self._usual_day(b.provider, now)
         if usual:
@@ -380,8 +383,7 @@ class Obol:
         blocks = [a for a in stops if a[1] == "block"]
         if blocks:
             r, _, v = blocks[0]
-            msg = v if isinstance(v, str) else (f"Obol: {ctx['line'] or 'budget used up'}. New turns are paused. "
-                                                "Add to it with /obol topup 5, or /obol allow to send one turn.")
+            msg = v if isinstance(v, str) else self._stopped(ctx)
             self._log("block", r["name"], ctx["line"])
             return {"action": "block", "message": msg if msg.startswith("Obol") else f"Obol: {msg}"}
         if stops:
@@ -410,6 +412,21 @@ class Obol:
         if notes and steer_to:
             notes.append(f"Requests are being routed to {steer_to} to stretch the budget.")
         return {"context": " ".join(notes)} if notes else None
+
+    def _stopped(self, ctx) -> str:
+        """What a stopped turn tells the person: what happened, when it ends, and every way out."""
+        lim = ctx.get("limit")
+        if not lim:
+            return (f"Obol: {ctx['line'] or 'stopped by your rule'}. /obol cap off removes the cap, /obol allow sends "
+                    "this one message, /obol pause 1h stops Obol acting for a while.")
+        name = f"{_budget.ADJ[lim['period']]} {lim['provider'] + ' ' if lim['provider'] else ''}limit"
+        over = lim["spent"] - lim["usd"]
+        need = math.ceil(max(over, 0)) + max(1, math.ceil(lim["usd"] * 0.25))
+        scope = f" {lim['provider']}" if lim["provider"] else ""
+        return (f"Obol: budget used up. You've spent {_budget._money(lim['spent'])} of your "
+                f"{_budget._money(lim['usd'])} {name}; it resets {_budget._when(lim['end'], self.clock())}. "
+                f"/obol topup {need}{scope} raises it, /obol allow sends this one message, "
+                "/obol mode alert stops blocking.")
 
     def _notice_text(self, rule, ctx) -> str:
         if "day_vs_usual" in rule["when"] and ctx.get("day_vs_usual"):
@@ -482,6 +499,12 @@ class Obol:
         if (self.store.meta("last_steer_logged") or "") != f"{req.get('model')}>{target}":
             self.store.set_meta("last_steer_logged", f"{req.get('model')}>{target}")
             self._log("steer", rule["name"], f"{req.get('model')} → {target} ({ctx['line']})")
+        day = int(_budget.period_bounds("day", self.clock())[0])
+        told = f"notified:steer:{req.get('model')}>{target}:{day}"
+        if self.store.meta(told) is None:             # answers are about to change: the person should know why
+            self.store.set_meta(told, self.clock())
+            self._queue_notice(kw.get("session_id") or "", f"switched from {req.get('model')} to {target} to stretch "
+                               f"the budget ({ctx['line']}). /obol mode alert stops switching.")
         return {"request": new, "source": "obol", "reason": f"rule '{rule['name']}': {ctx['line']}"}
 
     def api_request_error(self, **kw):

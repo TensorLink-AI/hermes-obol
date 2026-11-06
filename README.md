@@ -1,19 +1,28 @@
 # Obol
 
-**Know when Hermes will run out of budget, and act before it does.**
+**Stop surprise bills from Hermes. Obol warns you before your API spend passes a limit you set, and can switch to
+a cheaper model or stop at the limit.**
 
-Every Hermes plugin can count tokens. Obol forecasts them, and it learns your usage from Hermes's own session
-history the moment you install it. It meters every provider request, forecasts the
-rest of the day, week or month hour by hour, and tells you when, at this pace, the budget runs out. Then it
-acts on the forecast, not just on the wall:
+```sh
+hermes plugins install TensorLink-AI/hermes-obol
+hermes plugins enable obol
+```
 
-Pick what happens when the budget won't last:
+Restart Hermes (and its local gateway, `hermes gateway restart`), then in any session:
 
-| Mode | What Obol does |
-|---|---|
-| `alert` (default) | Tells you, under the agent's reply, and tells the agent, so it keeps answers short and asks before long work. |
-| `save` | Also switches to a cheaper model on the same provider, early, while there is still budget left. |
-| `stop` | Also stops new turns, and tool calls inside a running turn, once the budget is used up. |
+```
+/obol                    what you've spent, what's usual, and a budget to try
+/obol budget 20 week     set a limit
+/obol mode save          switch to a cheaper model when it won't last
+/obol cheap deepseek/deepseek-v4-flash
+/obol topup 5            add $5 to this period
+/obol pause 2h           take a break from Obol acting
+/obol more               everything else
+```
+
+Other usage plugins count tokens, show subscription quota or stop at a limit. Obol forecasts your API dollars, hour
+by hour, with a small model that runs on your CPU, offline. It learns from your Hermes history when you install it,
+so it works from day one, and it acts while there's still budget left.
 
 ```
 /obol
@@ -23,8 +32,21 @@ Obol · $6.20 of $20 · ⚠ on track to run out ~Fri 14:00
   last 48h  ▁▁▂▅▇▃▁▁▁▁▂▆█▅▂▁
 ```
 
-With no budget set, `/obol` still shows what you've spent, what a usual week costs you, where this one is
-heading, and a budget to try.
+## What happens when the budget won't last
+
+| Mode | What Obol does |
+|---|---|
+| `alert` (default) | Tells you, under the agent's reply, and tells the agent, so it keeps answers short and asks before long work. |
+| `save` | Also switches to a cheaper model on the same provider, early, and tells you under the reply. |
+| `stop` | Also stops new turns, and tool calls inside a running turn, once the budget is used up. `/obol allow` sends one anyway. |
+
+Every setting is also on the plugin's page under Desktop → Settings → Plugins. The agent can check the budget itself
+with the `obol_budget` tool. After upgrading, restart Hermes and its gateway so the new code loads.
+
+## Turning it off
+
+`/obol budget off` removes the limit, `/obol pause 2h` takes a break, `hermes plugins disable obol` turns it off and
+`hermes plugins remove obol` uninstalls it.
 
 ## Several APIs
 
@@ -114,28 +136,6 @@ is better):
 Weekly totals stay hard (about 40% median error) because agent usage is bursty, so treat the run-out time
 as an early warning, not a promise. This is one user's data, and it may overlap the model's training data.
 
-## Install
-
-```sh
-hermes plugins install TensorLink-AI/hermes-obol
-hermes plugins enable obol
-```
-
-Then in any session:
-
-```
-/obol                    how you're doing, and a suggested budget
-/obol budget 20 week     set a limit
-/obol mode save          switch to a cheaper model when it won't last
-/obol cheap deepseek/deepseek-v4-flash
-/obol topup 5            add $5 to this period
-/obol pause 2h           take a break from Obol acting
-/obol more               everything else
-```
-
-Every setting is also on the plugin's page under Desktop → Settings → Plugins. The agent can check the
-budget itself with the `obol_budget` tool.
-
 ## Disclosure
 
 - **What it reads:** the token counts and model of each provider request, from Hermes's
@@ -167,7 +167,6 @@ budget itself with the `obol_budget` tool.
 - **Credentials:** the optional Ephemeris key is a `secret` setting, read with
   `agent.secret_scope.get_secret`. Obol never reads `.env`, `auth.json` or any other tool's credentials.
 
-After upgrading Obol, restart Hermes (and its local gateway, `hermes gateway restart`) so the new code loads.
 
 ## Development
 

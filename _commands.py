@@ -14,7 +14,7 @@ TOOL_SCHEMA = {
 }
 
 HELP = """/obol                     how you're doing
-/obol budget 20 week      set a limit (day, week or month)
+/obol budget 20 week      set a limit (day, week or month; off removes it)
 /obol mode alert|save|stop
     alert: tell you and the agent when the budget won't last (default)
     save:  also switch to a cheaper model when it won't last (set it with /obol cheap <model>)
@@ -42,6 +42,10 @@ def _spark(xs):
     xs = [x or 0.0 for x in xs]
     top = max(xs) if xs else 0
     return "".join(SPARK[min(7, int(7 * x / top))] if top else SPARK[0] for x in xs)
+
+
+def _show(v) -> str:
+    return ", ".join(str(x) for x in v) if isinstance(v, list) else str(v)
 
 
 def _amount(text: str) -> float:
@@ -107,7 +111,9 @@ def run(obol, raw_args: str = "") -> str:
             b = obol.topup(amount, provider)
             if b is None:
                 return f"No budget{' for ' + provider if provider else ''} to top up: /obol budget 20 week"
-            return f"Added ${amount:g} to this {b.period} ({obol.label(b)}).\n" + _status(obol)
+            when = "today's" if b.period == "day" else f"this {b.period}'s"
+            name = f"{b.provider} budget" if b.provider else "budget"
+            return f"Added ${amount:g} to {when} {name}.\n" + _status(obol)
         if cmd == "allow":
             obol.store.set_meta("allow_once", obol.clock())
             return "The next held or stopped turn in the next hour goes through, tools included."
@@ -134,8 +140,8 @@ def run(obol, raw_args: str = "") -> str:
             lines = ["Rules in force" + (" (your `rules` setting):" if obol._get("rules", []) else
                                          f" (preset for mode {obol.budget().mode}):")]
             for r in obol.rules():
-                when = ", ".join(f"{k} {v}" for k, v in r["when"].items()) or "always"
-                do = ", ".join(k if v is True else f"{k} {v}" for k, v in r["do"].items())
+                when = "; ".join(f"{k} {_show(v)}" for k, v in r["when"].items()) or "always"
+                do = "; ".join(k if v is True else f"{k} {_show(v)}" for k, v in r["do"].items())
                 lines.append(f"  {r['name']}: when {when} → {do}")
             raw = obol._get("rules", []) or []
             bad = len(raw) - len(obol.rules()) if raw else 0
@@ -168,13 +174,15 @@ def _status(obol) -> str:
     lines = [f"Obol · {s['line']}",
              f"  {_budget.ADJ[b['period']]} budget{' on ' + b['provider'] if b['provider'] else ''} · {b['mode']} mode"
              + (f" (switches to {b['cheap_model']})" if b['mode'] == 'save' and b['cheap_model'] else "")]
+    if b["mode"] == "save" and not b["cheap_model"]:
+        lines.append("  ⚠ save mode can't switch yet: pick a model with /obol cheap <model>")
     if len(s.get("budgets") or []) > 1:
         for r in s["budgets"]:
             lines.append(f"  {r['label']}: {r['line']}")
     if s.get("forecaster"):
         lines.append(f"  forecast: {s['model']}" + (f" ({s['forecaster_note']})" if s.get("forecaster_note") else ""))
     hours = obol.store.hourly(until=obol.clock(), provider=b["provider"])[-48:]
-    if hours:
+    if len({v for _, v in hours}) > 1:                 # a flat line says nothing
         lines.append(f"  last {len(hours)}h  {_spark([v for _, v in hours])}")
     if (pu := obol.store.meta("paused_until")) and pu > obol.clock():
         lines.append(f"  paused until {datetime.fromtimestamp(pu):%a %H:%M} (/obol pause off)")
@@ -190,7 +198,9 @@ def _status(obol) -> str:
         lines.append(f"  last switch {datetime.fromtimestamp(st['at']):%a %H:%M}: {st['from']} → {st['to']}")
     if bad := s.get("steer_paused"):
         lines.append(f"  not switching for now: the provider refused {bad['model']} ({bad['error'][:80]})")
-    if s.get("forecaster") in ("cascade", "seasonal") and not s.get("ephemeris_key"):
+    if (s.get("forecaster") in ("cascade", "seasonal") and not s.get("ephemeris_key") and s["state"] == "ok"
+            and not obol.store.meta("ephemeris_hint_shown")):       # once, and never while you're short of budget
+        obol.store.set_meta("ephemeris_hint_shown", obol.clock())
         lines.append("  optional: larger hosted forecasting models via Ephemeris (key in Settings → Plugins → Obol)")
     if err := s.get("last_error"):
         lines.append(f"  {err['tier']} unavailable ({err['error'][:80]}); using the local forecast")
@@ -212,7 +222,7 @@ def _no_budget(obol, s) -> str:
     lines = ["Obol · no budget yet"]
     lr = s.get("learned")
     if not u.get("spent") and not u.get("usual"):
-        lines.append("  no spend recorded yet: Obol starts learning with your first request")
+        lines.append("  no spend yet. Set a limit now: /obol budget 20 week")
         return "\n".join(lines)
     per = u["period"]
     lines.append(f"  this {per}: {_budget._money(u['spent'])} so far"

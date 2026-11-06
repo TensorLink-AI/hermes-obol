@@ -96,7 +96,7 @@ def normalize(rule) -> dict | None:
 def presets(mode: str, cheap_model: str, unusual_x: float, max_request_usd: float) -> list:
     ladder = [m.strip() for m in (cheap_model or "").split(",") if m.strip()]
     rules = [{"name": "budget note", "when": {"state": ["tight", "over", "out"]}, "do": {"note": True}},
-             {"name": "budget alert", "when": {"state": ["over", "out"]}, "do": {"notify": True}}]
+             {"name": "budget alert", "when": {"state": ["tight", "over", "out"]}, "do": {"notify": True}}]
     if unusual_x and unusual_x > 0:
         rules.append({"name": "unusual day", "when": {"day_vs_usual": f">{unusual_x:g}x"}, "do": {"notify": True}})
     if mode == "save" and ladder:

@@ -32,14 +32,14 @@ config_schema:
     type: str
     choices: [day, week, month]
     default: week
-    label: "Per"
+    label: "Budget period"
     description: "Calendar day, week (from Monday) or month, in local time"
   mode:
     type: str
     choices: [alert, save, stop]
     default: alert
-    label: "When the budget won't last"
-    description: "alert: tell you and the agent · save: also switch to the cheaper model below · stop: also stop new turns once it's used up"
+    label: "When I'm about to run out"
+    description: "alert: warn me · save: also switch to the cheaper model below · stop: also refuse new messages once the budget is used up"
   cheap_model:
     type: str
     default: ""

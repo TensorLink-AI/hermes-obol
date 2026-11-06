@@ -157,9 +157,11 @@ def test_cascade_is_the_default_local_forecaster(make):
 
 
 def test_ephemeris_hint_only_in_status_and_only_without_key(make):
-    o = make({"budget_usd": 3, "period": "week"})
+    o = make({"budget_usd": 3000, "period": "week"})
     feed(o, 40, 0.05)
     assert "via Ephemeris" in _commands.run(o, "")
+    assert "via Ephemeris" not in _commands.run(o, "")  # once
+    o.store.set_meta("ephemeris_hint_shown", None)
     told = o.pre_llm_call(session_id="s1") or {}
     assert "Ephemeris" not in str(told)                 # never pushed into the agent's context
     o._secret = lambda n: "pc_live_x"
@@ -522,3 +524,46 @@ def test_hourly_cache_sees_late_rows(make):
     assert o.store.hourly(until=o.clock())[-1][1] == 1.0
     o.store.add_call(ts=o.clock() - HOUR + 60, session_id="s", provider="p", cost_usd=2.0)
     assert o.store.hourly(until=o.clock())[-1][1] == 3.0
+
+
+def test_the_person_hears_about_a_switch_under_the_reply_once(make):
+    o = make({"budget_usd": 1, "mode": "save", "cheap_model": "c/mini"})
+    feed(o, 10, 1.0)
+    assert o.llm_request(request={"model": "big"}, provider="p", session_id="s1")
+    out = o.transform_llm_output(session_id="s1", response_text="answer")
+    assert "switched from big to c/mini" in out and "/obol mode alert" in out
+    assert o.llm_request(request={"model": "big"}, provider="p", session_id="s1")
+    assert o.transform_llm_output(session_id="s1", response_text="answer") is None
+
+
+def test_save_without_a_model_says_so(make):
+    o = make({"budget_usd": 100, "mode": "save"})
+    assert "can't switch yet" in _commands.run(o, "")
+    o.cfg["cheap_model"] = "c/mini"
+    assert "can't switch yet" not in _commands.run(o, "")
+
+
+def test_stop_message_gives_the_limit_the_reset_and_a_topup_that_works(make):
+    o = make({"budget_usd": 10, "period": "day", "mode": "stop"})
+    feed(o, 30, 1.0)
+    msg = o.pre_llm_call(session_id="s1", user_message="x")["message"]
+    assert "daily limit" in msg and "resets" in msg and "/obol allow" in msg and "/obol mode alert" in msg
+    amount = msg.split("/obol topup ")[1].split()[0]
+    _commands.run(o, f"topup {amount}")
+    assert o.outlook().state != "out"
+
+
+def test_task_cap_stop_points_at_the_cap(make):
+    o = make({"mode": "stop", "budget_usd": 100})
+    feed(o, 2, 0.1)
+    _commands.run(o, "cap 1")
+    o.store.add_call(ts=o.clock() + 1, session_id="s1", provider="p", cost_usd=2.0)
+    o.clock_obj.t += 2
+    assert "/obol cap off" in o.pre_llm_call(session_id="s1", user_message="x")["message"]
+
+
+def test_tight_budget_tells_the_person(make):
+    o = make({"budget_usd": 100, "unusual_day_x": 0})
+    o.outlook = lambda b=None: _budget.Outlook(spent=50, usd=100, start=0, end=o.clock() + 9e4, end_median=90)
+    o.pre_llm_call(session_id="s1", user_message="x")
+    assert "close: on track" in o.store.meta("notice:s1")[0]
