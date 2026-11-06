@@ -1,6 +1,6 @@
 name: obol
 version: 0.1.0
-description: "Forecasts when Hermes will run out of budget and acts first: alerts you, switches to a cheaper model, or stops at the limit. Learns your usage on install and forecasts on your machine with the bundled Cascade 4M model; Ephemeris optional."
+description: "Know when you're going to run out of tokens, before it happens. Forecasts your token use on your own CPU, then warns you, switches to a cheaper model, or stops at your limit."
 author: TensorLink-AI
 license: Apache-2.0
 homepage: https://github.com/TensorLink-AI/hermes-obol

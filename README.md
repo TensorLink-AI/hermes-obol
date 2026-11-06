@@ -1,7 +1,9 @@
 # Obol
 
-**Stop surprise bills from Hermes. Obol warns you before your API spend passes a limit you set, and can switch to
-a cheaper model or stop at the limit.**
+**Know when you're going to run out of tokens, before it happens.**
+
+Obol forecasts your token use hour by hour and tells you when, at this pace, your budget runs out. It can warn you,
+switch to a cheaper model, or stop at the limit.
 
 ```sh
 hermes plugins install TensorLink-AI/hermes-obol
@@ -20,9 +22,9 @@ Restart Hermes (and its local gateway, `hermes gateway restart`), then in any se
 /obol more               everything else
 ```
 
-Other usage plugins count tokens, show subscription quota or stop at a limit. Obol forecasts your API dollars, hour
-by hour, with a small model that runs on your CPU, offline. It learns from your Hermes history when you install it,
-so it works from day one, and it acts while there's still budget left.
+The forecast comes from a small model that runs on your CPU, offline. It learns from your Hermes history when you
+install it, so it works from day one, and it acts while there's still budget left. Budgets are in dollars, for API
+usage; Obol doesn't read subscription quota windows.
 
 ```
 /obol

@@ -678,7 +678,7 @@ def register(ctx):
     ctx.register_hook("transform_llm_output", _safe(_obol.transform_llm_output))
     ctx.register_middleware("llm_request", _safe(_obol.llm_request))
     ctx.register_command("obol", lambda raw_args="", **_: _commands.run(_obol, raw_args),
-                         description="Budget, forecast and run-out time for this agent's spend",
+                         description="Know when you'll run out of tokens, before it happens",
                          args_hint="[budget <usd> <day|week|month> | mode <alert|save|stop> | topup <usd> | pause 2h | "
                                    "more]")
     ctx.register_tool(name="obol_budget", toolset="obol", schema=_commands.TOOL_SCHEMA,
