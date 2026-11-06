@@ -1,3 +1,4 @@
+import pytest
 import obol
 
 
@@ -71,9 +72,9 @@ def test_steer_swaps_model_only_when_forecast_says_so(make):
     o.cfg["budget_usd"] = 30
     r = o.llm_request(request=req, provider="openrouter")
     assert r["request"]["model"] == "cheap/mini" and req["model"] == "big/model"
-    assert o.llm_request(request=req, provider="anthropic") is not None  # budget covers all providers
+    assert o.llm_request(request=req, provider="myproxy") is not None    # budget covers all providers
     o.cfg["provider"] = "openrouter"
-    assert o.llm_request(request=req, provider="anthropic") is None
+    assert o.llm_request(request=req, provider="myproxy") is None
 
 
 def test_commands_roundtrip(make):
@@ -85,7 +86,7 @@ def test_commands_roundtrip(make):
     assert o.cfg["budgets"] == [{"provider": "openrouter", "usd": 10.0, "period": "day"}]
     assert "removed" in _commands.run(o, "budget 0 day openrouter") and o.cfg["budgets"] == []
     assert _commands.run(o, "mode nope").startswith("Usage")
-    assert "isn't a number" in _commands.run(o, "budget abc")
+    assert "amount above zero" in _commands.run(o, "budget abc")
 
 
 def test_choose_prefers_key_then_local_model(make, tmp_path):
@@ -363,3 +364,161 @@ def test_background_calls_reporting_auto_count_for_the_real_provider(make):
     o.meter(model="m", usage={"input_tokens": 10}, provider="openrouter", session_id="s1")
     o.meter(model="m", usage={"input_tokens": 10}, provider="auto", session_id="s1", aux_task="title_generation")
     assert o.store.providers(0) == ["openrouter"]
+
+
+# ── found in review ──────────────────────────────────────────────────────────
+
+def _spent_out(o, provider="openrouter", session="s1"):
+    feed(o, 10, 1.0, provider=provider, session=session)
+
+
+def test_allow_covers_that_turns_tools_and_only_that_turn(make):
+    o = make({"budget_usd": 1, "mode": "stop"})
+    _spent_out(o)
+    assert o.pre_tool_call(session_id="s1")["action"] == "block"
+    _commands.run(o, "allow")
+    assert "action" not in (o.pre_llm_call(session_id="s1", user_message="go") or {})
+    assert o.pre_tool_call(session_id="s1") is None
+    assert o.pre_tool_call(session_id="other")["action"] == "block"
+    assert o.pre_llm_call(session_id="s1", user_message="again")["action"] == "block"
+    assert o.pre_tool_call(session_id="s1")["action"] == "block"
+
+
+def test_allow_expires(make):
+    o = make({"budget_usd": 1, "mode": "stop"})
+    _spent_out(o)
+    _commands.run(o, "allow")
+    o.clock_obj.t += 2 * HOUR
+    assert o.pre_llm_call(session_id="s1", user_message="go")["action"] == "block"
+
+
+def test_new_session_doesnt_inherit_another_sessions_prompt_size(make):
+    o = make({"budget_usd": 1000, "max_request_usd": 0.5})
+    o.store.add_call(ts=o.clock() - 60, session_id="big", provider="p", model="openai/gpt-5", input_tokens=400_000)
+    assert o.store.last_prompt_tokens("new") == 0
+    assert o.pre_llm_call(session_id="new", user_message="hi", model="openai/gpt-5") is None
+
+
+def test_provider_budget_leaves_other_providers_alone(make):
+    o = make({"mode": "stop", "budgets": [{"provider": "anthropic", "usd": 1, "period": "week"}]})
+    _spent_out(o, provider="anthropic", session="a")
+    o.store.add_call(ts=o.clock() - 60, session_id="o", provider="openrouter", model="cheap", input_tokens=10)
+    o.store.add_call(ts=o.clock() - 60, session_id="a", provider="anthropic", model="m", input_tokens=10)
+    assert o.pre_llm_call(session_id="a", user_message="x")["action"] == "block"
+    assert o.pre_llm_call(session_id="o", user_message="x") is None
+    assert o.pre_llm_call(session_id="new", user_message="x", model="cheap") is None    # known model elsewhere
+    assert o.pre_llm_call(session_id="new2", user_message="x", model="m")["action"] == "block"
+    assert o.pre_llm_call(session_id="new3", user_message="x", model="never-seen") is None
+    assert o.pre_tool_call(session_id="o") is None
+
+
+def test_steer_stays_on_the_provider_and_only_goes_cheaper(make):
+    o = make({"budget_usd": 1, "mode": "save", "cheap_model": "gpt-5-mini",
+              "prices": {"gpt-5-mini": [1, 2], "claude-x": [3, 15], "tiny": [0.1, 0.2]}})
+    _spent_out(o)
+    assert o.llm_request(request={"model": "claude-x"}, provider="anthropic") is None       # can't serve it
+    assert o.llm_request(request={"model": "claude-x"}, provider="openrouter")["request"]["model"] == "gpt-5-mini"
+    assert o.llm_request(request={"model": "tiny"}, provider="openrouter") is None          # already cheaper
+
+
+def test_rejection_only_pauses_that_provider_and_ignores_other_failures(make):
+    o = make({"budget_usd": 1, "mode": "save", "cheap_model": "c/mini"})
+    _spent_out(o)
+    assert o.llm_request(request={"model": "big"}, provider="p1")
+    o.api_request_error(status_code=401, model="c/mini")                      # the key, not the model
+    o.api_request_error(status_code=404, model="other")                       # another request
+    assert o.store.meta("steer_failed") is None
+    o.api_request_error(status_code=404, model="c/mini")
+    assert o.llm_request(request={"model": "big"}, provider="p1") is None
+    assert o.llm_request(request={"model": "big"}, provider="p2")
+
+
+@pytest.mark.parametrize("bad", [[1, 2], "x", {"m": ["1", "two"]}, {"m": "12"}, {"m": [float("nan"), 1]}, {"m": [1]}])
+def test_bad_prices_setting_never_stops_metering(make, bad):
+    o = make({"prices": bad})
+    o.meter(session_id="s", provider="p", model="m", usage={"input_tokens": 10})
+    assert o.store.providers(0) == ["p"]
+    assert o.estimate_usd("m", 100) is None
+
+
+def test_two_budgets_alert_separately(make):
+    o = make({"mode": "alert", "unusual_day_x": 0, "budgets": [{"provider": "a", "usd": 1, "period": "week"},
+                                                              {"provider": "b", "usd": 1, "period": "week"}]})
+    _spent_out(o, provider="a", session="sa")
+    _spent_out(o, provider="b", session="sb")
+    o.pre_llm_call(session_id="sa", user_message="x")
+    o.pre_llm_call(session_id="sb", user_message="x")
+    assert o.store.meta("notice:sa") and o.store.meta("notice:sb")
+
+
+def test_corrupt_weights_back_off(make, monkeypatch):
+    o = make({"budget_usd": 100})
+    feed(o, 200, 0.1)
+    calls = []
+
+    def boom(*a, **k):
+        calls.append(1)
+        raise RuntimeError("bad weights")
+    monkeypatch.setattr(_forecast, "cascade", boom)
+    for _ in range(3):
+        assert o.forecast(o.budget())
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("text", ["topup -5", "topup nan", "topup inf", "budget nan", "budget inf", "budget -3", "cap 0"])
+def test_bad_amounts_are_refused(make, text):
+    o = make({"budget_usd": 5})
+    assert "amount above zero" in _commands.run(o, text)
+    assert o.budget().usd == 5 and o.outlook() is not None
+
+
+def test_topup_with_a_scoped_main_budget(make):
+    o = make({"budget_usd": 5, "provider": "openrouter"})
+    assert o.topup(5) is not None
+    assert o.outlook().usd == 10
+
+
+@pytest.mark.parametrize("v", ["$20", "abc", None, float("nan"), -4, [1]])
+def test_hand_edited_budget_never_raises(make, v):
+    o = make({"budget_usd": v, "unusual_day_x": "many", "max_request_usd": "lots"})
+    assert o.budget().usd == (20 if v == "$20" else 0)
+    assert o.pre_llm_call(session_id="s", user_message="x") is None
+    assert _commands.run(o, "")
+
+
+def test_price_rate_ignores_the_current_partial_hour(make):
+    o = make({"budget_usd": 100})
+    feed(o, 200, 0.01)
+    o.clock_obj.t += 600
+    o.store.add_call(ts=o.clock() - 60, session_id="s1", provider="openrouter", model="m", input_tokens=10, cost_usd=5.0)
+    seen = {}
+    real = _forecast.cascade
+    monkey = lambda *a, **k: (seen.update(rate=k["usd_per_token"]), real(*a, **k))[1]  # noqa: E731
+    _forecast.cascade, keep = monkey, real
+    try:
+        o.forecast(o.budget())
+    finally:
+        _forecast.cascade = keep
+    assert seen["rate"] == pytest.approx(0.01 / 1100)
+
+
+def test_failed_history_read_is_retried_later(make, monkeypatch):
+    o = make()
+    from obol import _backfill
+
+    def locked(*a, **k):
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(_backfill, "import_history", locked)
+    assert o.learn_history() == {} and o.store.meta("history_imported") is None
+    monkeypatch.setattr(_backfill, "import_history", lambda *a, **k: {"sessions": 2})
+    assert o.learn_history() == {}
+    o.clock_obj.t += 2 * HOUR
+    assert o.learn_history() == {"sessions": 2}
+
+
+def test_hourly_cache_sees_late_rows(make):
+    o = make()
+    feed(o, 5, 1.0)
+    assert o.store.hourly(until=o.clock())[-1][1] == 1.0
+    o.store.add_call(ts=o.clock() - HOUR + 60, session_id="s", provider="p", cost_usd=2.0)
+    assert o.store.hourly(until=o.clock())[-1][1] == 3.0

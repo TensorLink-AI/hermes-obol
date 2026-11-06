@@ -1,8 +1,8 @@
 """Obol plugin core.
 
 Meters every provider request (main loop and auxiliary calls), forecasts hourly spend, and depending on
-the budget's mode tells the agent (watch), switches to a cheaper model when the forecast says the budget
-won't last (steer), or stops new turns and tools once it is used up (guard).
+the budget's mode tells you and the agent (alert), switches to a cheaper model when the forecast says the
+budget won't last (save), or stops new turns and tools once it is used up (stop).
 """
 from __future__ import annotations
 
@@ -22,8 +22,12 @@ log = logging.getLogger("hermes_plugins.obol")
 SECRET = "EPHEMERIS_API_KEY"
 LOCAL_REFRESH = 10 * 60          # the seasonal forecast is cheap: recompute this often
 MODEL_REFRESH = HOUR             # local model / Ephemeris: at most hourly, and only after a new hour of data
-FAIL_BACKOFF = 3 * HOUR
-STEER_PAUSE = 6 * HOUR           # after the provider rejects the cheap model          # after an Ephemeris failure, stay local this long
+FAIL_BACKOFF = 3 * HOUR          # after a forecaster fails, leave it alone this long
+STEER_PAUSE = 6 * HOUR           # after the provider rejects the cheap model
+ALLOW_FOR = HOUR                 # /obol allow: how long it waits for a turn, and how long that turn's tools run
+# Providers that serve only their own models. Routers (OpenRouter and the like) can serve anything.
+OWN_MODELS = {"anthropic": ("claude",), "openai": ("gpt", "chatgpt", "o1", "o3", "o4"), "deepseek": ("deepseek",),
+              "gemini": ("gemini",), "google": ("gemini",), "xai": ("grok",)}
 
 
 class Obol:
@@ -55,14 +59,17 @@ class Obol:
         """Once per profile: import past usage from Hermes's session log so forecasts start right away."""
         if self.store.meta("history_imported") is not None:
             return self.store.meta("history_imported")
+        if (self.store.meta("history_failed_at") or 0) > self.clock() - HOUR:
+            return {}
         with self._lock:
             if self.store.meta("history_imported") is not None:
                 return self.store.meta("history_imported")
             try:
                 got = _backfill.import_history(self.store, self.data_dir, self.prices.cost, self.clock())
-            except Exception as e:
+            except Exception as e:                # a locked state.db, say: try again later, not on every hook
                 log.warning("obol: couldn't read past usage: %s", e)
-                got = {"error": str(e)[:200]}
+                self.store.set_meta("history_failed_at", self.clock())
+                return {}
             self.store.set_meta("history_imported", got or {"sessions": 0})
             return got
 
@@ -84,10 +91,7 @@ class Obol:
         for e in self._get("budgets", []) or []:
             if not isinstance(e, dict) or not e.get("provider"):
                 continue
-            try:
-                usd = float(e.get("usd") or 0)
-            except (TypeError, ValueError):
-                continue
+            usd = _budget.number(e.get("usd"))
             period = e.get("period") if e.get("period") in _budget.PERIODS else "week"
             if usd > 0:
                 out.append(dataclasses.replace(main, usd=usd, period=period, provider=str(e["provider"])))
@@ -101,8 +105,11 @@ class Obol:
 
     def topup(self, amount: float, provider: str = "") -> _budget.Budget | None:
         """Add to the current period of the budget for `provider` ("" = the main budget)."""
-        b = next((x for x in self.budgets() if x.provider == provider), None)
-        if b is None:
+        if not amount > 0 or amount == float("inf"):
+            raise ValueError("a top-up must be a positive amount")
+        main = self.budget()
+        b = main if provider in ("", main.provider) else next((x for x in self.budgets() if x.provider == provider), None)
+        if b is None or not b.active:
             return None
         start, _ = _budget.period_bounds(b.period, self.clock())
         key = f"topup:{b.provider or '*'}:{b.period}:{int(start)}"
@@ -124,7 +131,11 @@ class Obol:
         provider = kw.get("provider") or ""
         if provider in ("", "auto"):        # background calls can report "auto": charge them to the real provider
             provider = self.store.last_provider(kw.get("session_id") or "") or self.store.latest_provider() or provider
-        cost, status = self.prices.cost(model, usage)
+        try:
+            cost, status = self.prices.cost(model, usage)
+        except Exception:                   # the request still happened: record it, unpriced
+            log.warning("obol: couldn't price %s", model, exc_info=True)
+            cost, status = None, "unpriced"
         if self.prices.stale(self.clock()):
             self.prices.refresh_async(on_done=lambda: self.store.reprice(self.prices.cost))
         self.store.add_call(
@@ -151,6 +162,8 @@ class Obol:
                                       self.data_dir, len(hours))
         if tier == "ephemeris" and (self.store.meta("ephemeris_failed_at") or 0) > now - FAIL_BACKOFF:
             tier, note = _forecast.choose("cascade", False, self.data_dir, len(hours))
+        if tier == "cascade" and (self.store.meta("cascade_failed_at") or 0) > now - FAIL_BACKOFF:
+            tier, note = "seasonal", "cascade failed"
         current = bool(cached) and cached.get("data_until") == newest and cached.get("horizon", 0) >= horizon
         age = now - cached["made_at"] if cached else float("inf")
         if tier == "seasonal":
@@ -166,11 +179,14 @@ class Obol:
                 tokens = self.store.hourly_tokens(until=now, provider=b.provider)
                 week = now - 7 * 86400
                 tok_week = sum(v for h, v in tokens if h >= week)
-                rate = (self.store.spent(week, now, b.provider) / tok_week) if tok_week else None
+                # both sides over completed hours: the current hour's spend has no tokens in `tokens` yet
+                done = int(now // HOUR) * HOUR
+                rate = (self.store.spent(week, done, b.provider) / tok_week) if tok_week else None
                 cached = self._stamp(_forecast.cascade(hours, horizon, tokens=tokens, usd_per_token=rate),
                                      newest, horizon, note)
             except Exception as e:
                 self.store.set_meta("last_error", {"tier": tier, "error": str(e)[:200], "at": now})
+                self.store.set_meta("cascade_failed_at", now)
                 log.warning("obol: cascade forecast failed: %s", e)
                 cached = self._stamp(_forecast.seasonal(hours, horizon), newest, horizon, "cascade failed")
             self.store.set_meta(key, cached)
@@ -272,7 +288,8 @@ class Obol:
     def context(self, *, session_id="", provider=None, model="", platform="", aux=False, request_usd=None) -> dict:
         now = self.clock()
         b = self.budget()
-        provider = self.store.last_provider(session_id) if provider is None else provider
+        if provider is None:                # a session's first turn has no rows: go by the model it's about to use
+            provider = self.store.last_provider(session_id) or self.store.provider_of_model(model)
         ctx = {"provider": provider, "model": model, "platform": platform, "aux": aux, "request_usd": request_usd,
                "state": "ok", "runs_out_in": None, "spent_pct": None, "day_vs_usual": None, "line": ""}
         many = len(self.budgets()) > 1
@@ -289,7 +306,7 @@ class Obol:
         if worst:
             _, bb, o = worst
             line = _budget.line(o, now)
-            ctx.update(state=o.state if o.state != "unknown" else "ok", spent_pct=100 * o.spent / o.usd,
+            ctx.update(state=o.state if o.state != "unknown" else "ok", spent_pct=100 * o.spent / o.usd if o.usd > 0 else None,
                        runs_out_in=(o.out_median - now) if o.out_median else None,
                        line=f"{self.label(bb)}: {line}" if many else line, budget_provider=bb.provider)
         job = self.store.meta("job_cap")
@@ -311,8 +328,8 @@ class Obol:
             return [r for r in (_rules.normalize(x) for x in raw) if r]
         b = self.budget()
         return [_rules.normalize(r) for r in _rules.presets(
-            b.mode, b.cheap_model, float(self._get("unusual_day_x", 3) or 0),
-            float(self._get("max_request_usd", 0) or 0))]
+            b.mode, b.cheap_model, _budget.number(self._get("unusual_day_x", 3)),
+            _budget.number(self._get("max_request_usd", 0)))]
 
     def _paused(self) -> bool:
         return (self.store.meta("paused_until") or 0) > self.clock()
@@ -323,7 +340,20 @@ class Obol:
         self.store.set_meta("actions", log_[-30:])
 
     def _in_scope(self, b, provider: str) -> bool:
-        return not b.provider or not provider or provider == b.provider
+        """A budget for one provider covers that provider only: an unknown provider answers to the others."""
+        return not b.provider or provider == b.provider
+
+    def _allowed_turn(self, sid: str) -> bool:
+        at = self.store.meta(f"allowed_turn:{sid}")
+        return bool(at) and self.clock() - at < ALLOW_FOR
+
+    def _can_steer(self, target: str, current: str, provider: str) -> bool:
+        """Only to a model this provider can serve, and only if it's actually cheaper (when both prices are known)."""
+        own = OWN_MODELS.get((provider or "").lower())
+        if own and not target.rsplit("/", 1)[-1].lower().startswith(own):
+            return False
+        new, old = self.prices.rate(target), self.prices.rate(current)
+        return not (new and old and new[0] >= old[0] and new[1] >= old[1])
 
     # ── acting ───────────────────────────────────────────────────────────────
     def pre_llm_call(self, **kw):
@@ -331,6 +361,7 @@ class Obol:
         if self._paused():
             return None
         sid = kw.get("session_id") or ""
+        self.store.set_meta(f"allowed_turn:{sid}", None)    # runs once per turn: last turn's allowance is over
         # The hook sees the conversation but not the system prompt or tool definitions, so start from the size
         # of the last real request (which includes them) plus the new message.
         new_msg = self._tokens([kw.get("user_message") or ""])
@@ -340,8 +371,10 @@ class Obol:
         ctx["request_tokens"] = tokens
         acts = _rules.evaluate(self.rules(), ctx)
         stops = [a for a in acts if a[1] in ("block", "ask")]
-        if stops and self.store.meta("allow_once"):
+        allow = self.store.meta("allow_once")
+        if stops and allow and self.clock() - allow < ALLOW_FOR:
             self.store.set_meta("allow_once", None)
+            self.store.set_meta(f"allowed_turn:{sid}", self.clock())   # its tools too, or the turn can't do anything
             self._log("allowed", stops[0][0]["name"], "one turn let through by /obol allow")
             stops = []
         blocks = [a for a in stops if a[1] == "block"]
@@ -360,7 +393,7 @@ class Obol:
                                                   "Send /obol allow to let this one through."}
         notes, steer_to = [], None
         for r, action, v in acts:
-            key = f"{r['name']}:{ctx['state']}"
+            key = f"{r['name']}:{ctx['state']}:{ctx.get('budget_provider', '')}"
             if action == "steer" and steer_to is None:
                 steer_to = _rules.steer_target(v, ctx["state"])
             elif action == "note" and self.store.meta(f"told:{sid}:{key}") is None:
@@ -404,7 +437,10 @@ class Obol:
         """A long turn can't keep spending past the limit through its tool loop."""
         if self._paused():
             return None
-        ctx = self.context(session_id=kw.get("session_id") or "", platform=kw.get("platform") or "")
+        sid = kw.get("session_id") or ""
+        if self._allowed_turn(sid):
+            return None
+        ctx = self.context(session_id=sid, platform=kw.get("platform") or "")
         acts = [a for a in _rules.evaluate(self.rules(), ctx) if a[1] in ("block", "ask")]
         if not acts:
             return None
@@ -423,7 +459,8 @@ class Obol:
         if self._paused() or not isinstance(req, dict) or "model" not in req:
             return None
         tokens = self._tokens(req.get("messages") or req.get("input") or []) + len(json.dumps(req.get("tools") or [])) // 4
-        ctx = self.context(provider=kw.get("provider") or "", model=req.get("model") or "",
+        provider = kw.get("provider") or None
+        ctx = self.context(session_id=kw.get("session_id") or "", provider=provider, model=req.get("model") or "",
                            platform=kw.get("platform") or "", request_usd=self.estimate_usd(req.get("model"), tokens))
         target = None
         for r, action, v in _rules.evaluate(self.rules(), ctx):
@@ -432,13 +469,16 @@ class Obol:
                 break
         if not target or target == req.get("model"):
             return None
+        if not self._can_steer(target, req.get("model"), ctx["provider"]):
+            return None
         bad = self.store.meta("steer_failed")
-        if bad and bad.get("model") == target and self.clock() - bad["at"] < STEER_PAUSE:
+        if (bad and bad.get("model") == target and bad.get("provider", "") in ("", ctx["provider"])
+                and self.clock() - bad["at"] < STEER_PAUSE):
             return None
         new = dict(req)
         new["model"] = target
         self.store.set_meta("last_steer", {"at": self.clock(), "from": req.get("model"), "to": target,
-                                           "state": ctx["state"]})
+                                           "state": ctx["state"], "provider": ctx["provider"]})
         if (self.store.meta("last_steer_logged") or "") != f"{req.get('model')}>{target}":
             self.store.set_meta("last_steer_logged", f"{req.get('model')}>{target}")
             self._log("steer", rule["name"], f"{req.get('model')} → {target} ({ctx['line']})")
@@ -450,9 +490,12 @@ class Obol:
         steer = self.store.meta("last_steer")
         if not steer or self.clock() - steer["at"] > 120:
             return None
-        if kw.get("status_code") in (400, 401, 403, 404, 422):
+        if kw.get("model") and kw["model"] != steer["to"]:   # some other request's failure
+            return None
+        if kw.get("status_code") in (400, 403, 404, 422):     # 401 is the key, not the model
             msg = str((kw.get("error") or {}).get("message") or kw.get("reason") or "")[:200]
-            self.store.set_meta("steer_failed", {"model": steer["to"], "at": self.clock(), "error": msg})
+            self.store.set_meta("steer_failed", {"model": steer["to"], "at": self.clock(), "error": msg,
+                                                "provider": steer.get("provider", "")})
             log.warning("obol: provider rejected cheap model %s; steering paused", steer["to"])
         return None
 
@@ -471,7 +514,7 @@ class Obol:
             o = _budget.outlook(b, spent, this_hour, self.forecast(b), now)
             week = now - 7 * 86400
             tok = sum(v for h, v in self.store.hourly_tokens(until=now, provider=prov) if h >= week)
-            usd7 = self.store.spent(week, now, prov)
+            usd7 = self.store.spent(week, int(now // HOUR) * HOUR, prov)
             own = next((x for x in self.budgets() if x.provider == prov), None)
             ob = self.outlook(own) if own else None
             out.append({"provider": prov, "spent": spent, "expected": o.end_median, "period": period,
@@ -571,7 +614,7 @@ def register(ctx):
     ctx.register_middleware("llm_request", _safe(_obol.llm_request))
     ctx.register_command("obol", lambda raw_args="", **_: _commands.run(_obol, raw_args),
                          description="Budget, forecast and run-out time for this agent's spend",
-                         args_hint="[budget <usd> <day|week|month> | mode <watch|steer|guard> | cheap <model> | "
-                                   "forecast | models]")
+                         args_hint="[budget <usd> <day|week|month> | mode <alert|save|stop> | topup <usd> | pause 2h | "
+                                   "more]")
     ctx.register_tool(name="obol_budget", toolset="obol", schema=_commands.TOOL_SCHEMA,
                       handler=lambda args=None, **_: json.dumps(_obol.status(), default=str))

@@ -1,7 +1,7 @@
 """/obol: the slash command (CLI, gateway and Desktop), and the agent-facing tool schema."""
 from __future__ import annotations
 
-import time
+import math
 from datetime import datetime
 
 from . import _budget, _forecast, _rules
@@ -44,6 +44,14 @@ def _spark(xs):
     return "".join(SPARK[min(7, int(7 * x / top))] if top else SPARK[0] for x in xs)
 
 
+def _amount(text: str) -> float:
+    """A positive, finite amount typed by the user; ValueError otherwise (`nan` and `inf` parse as floats)."""
+    x = float(text.lstrip("+$"))
+    if not math.isfinite(x) or x <= 0:
+        raise ValueError(text)
+    return x
+
+
 def run(obol, raw_args: str = "") -> str:
     args = (raw_args or "").split()
     cmd = args[0].lower() if args else ""
@@ -57,7 +65,7 @@ def run(obol, raw_args: str = "") -> str:
         if cmd == "budget":
             if len(args) < 2:
                 return "Usage: /obol budget <usd> [day|week|month] [provider]"
-            usd = 0.0 if args[1] in ("off", "none") else float(args[1].lstrip("$"))
+            usd = 0.0 if args[1] in ("off", "none", "0") else _amount(args[1])
             period = args[2] if len(args) > 2 else None
             if period and period not in _budget.PERIODS:
                 return f"Period must be one of {', '.join(_budget.PERIODS)}."
@@ -94,7 +102,7 @@ def run(obol, raw_args: str = "") -> str:
         if cmd == "topup" or (cmd == "allow" and len(args) > 1):
             if len(args) < 2:
                 return "Usage: /obol topup 5"
-            amount = float(args[1].lstrip("+$"))
+            amount = _amount(args[1])
             provider = args[2] if len(args) > 2 else ""
             b = obol.topup(amount, provider)
             if b is None:
@@ -102,7 +110,7 @@ def run(obol, raw_args: str = "") -> str:
             return f"Added ${amount:g} to this {b.period} ({obol.label(b)}).\n" + _status(obol)
         if cmd == "allow":
             obol.store.set_meta("allow_once", obol.clock())
-            return "The next held or blocked turn will go through once."
+            return "The next held or stopped turn in the next hour goes through, tools included."
         if cmd == "pause":
             if args[1:2] in (["off"], ["resume"]):
                 obol.store.set_meta("paused_until", None)
@@ -118,7 +126,7 @@ def run(obol, raw_args: str = "") -> str:
             if args[1:2] == ["off"] or len(args) < 2:
                 obol.store.set_meta("job_cap", None)
                 return "Task cap removed."
-            usd = float(args[1].lstrip("$"))
+            usd = _amount(args[1])
             obol.store.set_meta("job_cap", {"usd": usd, "since": obol.clock()})
             obol._log("cap", "you", f"${usd:g} from now")
             return f"Task cap set: at most ${usd:g} more from now. /obol cap off removes it."
@@ -149,7 +157,7 @@ def run(obol, raw_args: str = "") -> str:
             return _models(obol)
         return f"Unknown: /obol {cmd}\n" + HELP
     except ValueError:
-        return "That isn't a number, e.g. /obol budget 20 week"
+        return "That needs an amount above zero, e.g. /obol budget 20 week"
 
 
 def _status(obol) -> str:
@@ -165,7 +173,7 @@ def _status(obol) -> str:
             lines.append(f"  {r['label']}: {r['line']}")
     if s.get("forecaster"):
         lines.append(f"  forecast: {s['model']}" + (f" ({s['forecaster_note']})" if s.get("forecaster_note") else ""))
-    hours = obol.store.hourly(provider=b["provider"])[-48:]
+    hours = obol.store.hourly(until=obol.clock(), provider=b["provider"])[-48:]
     if hours:
         lines.append(f"  last {len(hours)}h  {_spark([v for _, v in hours])}")
     if (pu := obol.store.meta("paused_until")) and pu > obol.clock():
@@ -242,7 +250,7 @@ def _hours(obol) -> str:
     f = obol.forecast(b)
     if not f:
         return "No spend recorded yet: Obol starts forecasting after the first request."
-    now = time.time()
+    now = obol.clock()
     q = f["quantiles"]
     rows = [f"Forecast by {f['model']} (per-hour ranges are nominal 10–90%):"]
     for i in range(min(12, len(q["0.5"]))):
@@ -258,7 +266,7 @@ def _hours(obol) -> str:
 
 def _models(obol) -> str:
     b = obol.budget()
-    start, _ = _budget.period_bounds(b.period)
+    start, _ = _budget.period_bounds(b.period, obol.clock())
     rows = obol.store.by_model(start, b.provider)
     if not rows:
         return "No requests this period."

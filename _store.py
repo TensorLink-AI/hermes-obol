@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS calls (
   cost_usd REAL, cost_status TEXT
 );
 CREATE INDEX IF NOT EXISTS calls_ts ON calls(ts);
+CREATE INDEX IF NOT EXISTS calls_provider_ts ON calls(provider, ts);
+CREATE INDEX IF NOT EXISTS calls_session_ts ON calls(session_id, ts);
+CREATE INDEX IF NOT EXISTS calls_model_ts ON calls(model, ts);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 """
 
@@ -30,6 +33,7 @@ class Store:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._hourly = {}             # completed hours don't change, and the hooks ask on every call
         with closing(self._conn()) as c, c:
             c.execute("PRAGMA journal_mode=WAL")
             c.executescript(_SCHEMA)
@@ -47,6 +51,8 @@ class Store:
                       (ts, session_id, platform, provider, model, aux_task, int(input_tokens or 0),
                        int(output_tokens or 0), int(cache_read_tokens or 0), int(cache_write_tokens or 0),
                        int(reasoning_tokens or 0), cost_usd, cost_status))
+        if any(ts < k[3] for k in list(self._hourly)):      # a row for an hour already cached
+            self._hourly.clear()
         first = self.meta("first_call_at")
         if first is None or ts < float(first):
             self.set_meta("first_call_at", ts)
@@ -63,6 +69,7 @@ class Store:
                 if usd is not None:
                     c.execute("UPDATE calls SET cost_usd=?, cost_status=? WHERE rowid=?", (usd, status, rowid))
                     n += 1
+        self._hourly.clear()
         return n
 
     def add_calls(self, rows) -> None:
@@ -72,6 +79,7 @@ class Store:
         with closing(self._conn()) as c, c:
             c.executemany("INSERT INTO calls VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                           [tuple(r.get(k, 0 if k.endswith("tokens") else "") for k in cols) for r in rows])
+        self._hourly.clear()
 
     def _scope(self, provider: str):
         return ("AND provider = ?", (provider,)) if provider else ("", ())
@@ -109,17 +117,33 @@ class Store:
         if first is None:
             return []
         start = max(int(float(first) // HOUR) * HOUR, end - max_hours * HOUR)
+        key = (provider, column, start, end)
+        if key in self._hourly:
+            return self._hourly[key]
         where, args = self._scope(provider)
         with closing(self._conn()) as c:
             rows = c.execute(f"SELECT CAST(ts/{HOUR} AS INTEGER)*{HOUR} h, SUM({column}) "
                              f"FROM calls WHERE ts>=? AND ts<? {where} GROUP BY h", (start, end, *args)).fetchall()
         got = {int(h): float(v) for h, v in rows}
-        return [(h, got.get(h, 0.0)) for h in range(start, end, HOUR)]
+        out = [(h, got.get(h, 0.0)) for h in range(start, end, HOUR)]
+        if len(self._hourly) > 32:
+            self._hourly.clear()
+        self._hourly[key] = out
+        return out
 
     def last_provider(self, session_id: str) -> str:
         with closing(self._conn()) as c:
             row = c.execute("SELECT provider FROM calls WHERE session_id=? AND aux_task='' ORDER BY ts DESC LIMIT 1",
                             (session_id,)).fetchone()
+        return row[0] if row else ""
+
+    def provider_of_model(self, model: str) -> str:
+        """The provider this model last went through: a new session's best hint before its first request."""
+        if not model:
+            return ""
+        with closing(self._conn()) as c:
+            row = c.execute("SELECT provider FROM calls WHERE model=? AND provider NOT IN ('', 'auto') "
+                            "ORDER BY ts DESC LIMIT 1", (model,)).fetchone()
         return row[0] if row else ""
 
     def latest_provider(self) -> str:
@@ -133,17 +157,14 @@ class Store:
             return [r[0] for r in c.execute("SELECT DISTINCT provider FROM calls WHERE ts>=? AND provider NOT IN "
                                             "('', 'auto')", (since,))]
 
-    def last_prompt_tokens(self, session_id: str = "") -> int:
-        """Prompt size (input + cache) of the latest main-loop request, in this session if it has one."""
+    def last_prompt_tokens(self, session_id: str) -> int:
+        """Prompt size (input + cache) of this session's latest main-loop request; 0 for a new session."""
+        if not session_id:
+            return 0
         with closing(self._conn()) as c:
-            for where, args in (("session_id=? AND", (session_id,)), ("", ())):
-                if where and not session_id:
-                    continue
-                row = c.execute(f"SELECT input_tokens + cache_read_tokens + cache_write_tokens FROM calls WHERE {where} "
-                                "aux_task='' ORDER BY ts DESC LIMIT 1", args).fetchone()
-                if row and row[0]:
-                    return int(row[0])
-        return 0
+            row = c.execute("SELECT input_tokens + cache_read_tokens + cache_write_tokens FROM calls "
+                            "WHERE session_id=? AND aux_task='' ORDER BY ts DESC LIMIT 1", (session_id,)).fetchone()
+        return int(row[0]) if row and row[0] else 0
 
     def by_model(self, since: float, provider: str = ""):
         where, args = self._scope(provider)

@@ -8,6 +8,7 @@ independently, so a sum of 90% values is not a 90% bound on the total (or on any
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -23,6 +24,15 @@ PERIODS = ("day", "week", "month")
 ADJ = {"day": "daily", "week": "weekly", "month": "monthly"}
 
 
+def number(value, default: float = 0.0) -> float:
+    """A setting as a usable non-negative amount. Hand-edited config never raises in a hook."""
+    try:
+        x = float(str(value).strip().lstrip("$+")) if value is not None else default
+    except ValueError:
+        return default
+    return x if math.isfinite(x) and x >= 0 else default
+
+
 @dataclass
 class Budget:
     usd: float = 0.0
@@ -33,7 +43,7 @@ class Budget:
 
     @classmethod
     def from_config(cls, get) -> "Budget":
-        b = cls(usd=float(get("budget_usd", 0) or 0), period=str(get("period", "week") or "week"),
+        b = cls(usd=number(get("budget_usd", 0)), period=str(get("period", "week") or "week"),
                 provider=str(get("provider", "") or ""), mode=str(get("mode", "alert") or "alert"),
                 cheap_model=str(get("cheap_model", "") or ""))
         b.period = b.period if b.period in PERIODS else "week"

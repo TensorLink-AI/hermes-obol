@@ -5,7 +5,7 @@ author: TensorLink-AI
 license: Apache-2.0
 homepage: https://github.com/TensorLink-AI/hermes-obol
 manifest_version: 1
-requires_hermes: ">=0.22.0"
+requires_hermes: ">=0.22.7"
 kind: standalone
 tags: [budget, cost, tokens, forecasting, guard]
 provides_tools:

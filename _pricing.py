@@ -12,6 +12,7 @@ providers these are API-equivalent dollars, not what the subscription bills.
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
 import time
@@ -125,13 +126,26 @@ class Prices:
 
         threading.Thread(target=run, name="obol-prices", daemon=True).start()
 
+    def _mine(self) -> dict:
+        """The `prices` setting; a malformed entry is skipped, never raised (a hook must keep metering)."""
+        raw = self.overrides()
+        out = {}
+        for k, v in (raw.items() if isinstance(raw, dict) else ()):
+            if not isinstance(v, (list, tuple)) or len(v) < 2:
+                continue
+            try:
+                nums = tuple(float(x) for x in v)
+            except (TypeError, ValueError):
+                continue
+            if all(math.isfinite(n) and n >= 0 for n in nums):
+                out[normalize(str(k))] = nums + (nums[0],) * (4 - len(nums))
+        return out
+
     def rate(self, model: str | None):
         m = normalize(model)
         if not m:
             return None
-        mine = {normalize(k): tuple(v) + (v[0],) * (4 - len(v)) for k, v in (self.overrides() or {}).items()
-                if isinstance(v, (list, tuple)) and len(v) >= 2}
-        for table in (mine, self._catalogue(), BUILTIN):
+        for table in (self._mine(), self._catalogue(), BUILTIN):
             r = _match(table, m)
             if r:
                 return r
