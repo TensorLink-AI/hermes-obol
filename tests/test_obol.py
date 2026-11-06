@@ -86,9 +86,10 @@ def test_commands_roundtrip(make):
 
 
 def test_choose_prefers_key_then_local_model(make, tmp_path):
-    assert _forecast.choose("auto", True, tmp_path, 100)[0] == "ephemeris"
-    assert _forecast.choose("auto", False, tmp_path, 100)[0] == "cascade"
-    assert _forecast.choose("seasonal", False, tmp_path, 100)[0] == "seasonal"
+    assert _forecast.choose("auto", True, tmp_path, 200)[0] == "ephemeris"
+    assert _forecast.choose("auto", False, tmp_path, 200)[0] == "cascade"
+    assert _forecast.choose("auto", False, tmp_path, 100)[0] == "seasonal"     # under 128 points
+    assert _forecast.choose("seasonal", False, tmp_path, 200)[0] == "seasonal"
     assert _forecast.choose("auto", True, tmp_path, 5)[0] == "seasonal"
 
 
@@ -134,19 +135,19 @@ def test_cascade_numpy_matches_torch_reference():
     import numpy as np
     from pathlib import Path
     from obol import _cascade
-    m = _cascade.Cascade4M()
     for case in json.loads((Path(__file__).parent / "cascade_golden.json").read_text()):
-        got = m.quantiles(case["history"], case["horizon"])
-        want = np.array(case["torch_quantiles"])
+        got = _cascade.model(case["model"]).quantiles(case["history"], case["horizon"])
+        want = np.array(case["torch_quantiles"])               # float32 torch reference; weights ship as float16
         assert got.shape == want.shape
-        assert np.abs(got - want).max() <= 1e-4 * (np.abs(want).max() + 1e-6), case["name"]
+        assert np.abs(got - want).max() <= 5e-3 * (np.abs(want).max() + 1e-6), (case["model"], case["name"])
 
 
 def test_cascade_is_the_default_local_forecaster(make):
-    o = make({"budget_usd": 3, "period": "week"})
-    feed(o, 40, 0.05)
+    o = make({"budget_usd": 30, "period": "week"})
+    feed(o, 200, 0.05)                                   # 1000 input + 100 output tokens an hour
     f = o.forecast()
-    assert f["tier"] == "cascade" and len(f["quantiles"]["0.5"]) == f["horizon"]
+    assert f["tier"] == "cascade" and "toktok" in f["model"] and len(f["quantiles"]["0.5"]) == f["horizon"]
+    assert 0.02 < f["mean"][0] < 0.15                    # tokens forecast, converted back at $0.05 per 1100 tokens
     assert all(v >= 0 for v in f["quantiles"]["0.1"])
     assert o.outlook().state in ("ok", "tight", "over")
 

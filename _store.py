@@ -91,7 +91,13 @@ class Store:
             return int(c.execute(f"SELECT COUNT(*) FROM calls WHERE ts>=? AND cost_usd IS NULL {where}",
                                  (since, *args)).fetchone()[0])
 
-    def hourly(self, until: float | None = None, provider: str = "", max_hours: int = 2048):
+    def hourly_tokens(self, until: float | None = None, provider: str = "", max_hours: int = 4096):
+        """Same grid as hourly(), but total tokens (input + cache read + cache write + output) per hour."""
+        return self.hourly(until, provider, max_hours, column="input_tokens + cache_read_tokens + "
+                                                              "cache_write_tokens + output_tokens")
+
+    def hourly(self, until: float | None = None, provider: str = "", max_hours: int = 2048,
+               column: str = "COALESCE(cost_usd,0)"):
         """Completed hours of spend, oldest first: (hour_start, usd).
 
         Starts at the hour of the first metered call (hours before Obol was watching are unknown and are
@@ -105,7 +111,7 @@ class Store:
         start = max(int(float(first) // HOUR) * HOUR, end - max_hours * HOUR)
         where, args = self._scope(provider)
         with closing(self._conn()) as c:
-            rows = c.execute(f"SELECT CAST(ts/{HOUR} AS INTEGER)*{HOUR} h, SUM(COALESCE(cost_usd,0)) "
+            rows = c.execute(f"SELECT CAST(ts/{HOUR} AS INTEGER)*{HOUR} h, SUM({column}) "
                              f"FROM calls WHERE ts>=? AND ts<? {where} GROUP BY h", (start, end, *args)).fetchall()
         got = {int(h): float(v) for h, v in rows}
         return [(h, got.get(h, 0.0)) for h in range(start, end, HOUR)]

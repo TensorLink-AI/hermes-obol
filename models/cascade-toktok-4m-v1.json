@@ -1,0 +1,32 @@
+{
+  "arch": "toto2-4m",
+  "toto2": {
+    "d_model": 256,
+    "num_layers": 4,
+    "num_heads": 4,
+    "head_dim": 64,
+    "patch_size": 32,
+    "mlp_expansion": 2,
+    "d_ff": 688,
+    "num_quantiles": 9,
+    "context_length": 4096,
+    "horizon": 64,
+    "max_patches": 134,
+    "layer_group_size": 4,
+    "cpm_c_max": 16,
+    "cpm_p_max": 0.4,
+    "residual_mult": 0.75
+  },
+  "quantile_levels": [
+    0.1,
+    0.2,
+    0.3,
+    0.4,
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    0.9
+  ],
+  "input_transform": "arcsinh_causal"
+}

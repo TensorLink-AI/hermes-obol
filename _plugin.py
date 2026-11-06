@@ -123,7 +123,12 @@ class Obol:
             return cached
         if tier == "cascade":   # ~50 ms on a CPU: run it here, no thread, no stand-in
             try:
-                cached = self._stamp(_forecast.cascade(hours, horizon), newest, horizon, note)
+                tokens = self.store.hourly_tokens(until=now, provider=b.provider)
+                week = now - 7 * 86400
+                tok_week = sum(v for h, v in tokens if h >= week)
+                rate = (self.store.spent(week, now, b.provider) / tok_week) if tok_week else None
+                cached = self._stamp(_forecast.cascade(hours, horizon, tokens=tokens, usd_per_token=rate),
+                                     newest, horizon, note)
             except Exception as e:
                 self.store.set_meta("last_error", {"tier": tier, "error": str(e)[:200], "at": now})
                 log.warning("obol: cascade forecast failed: %s", e)
@@ -425,8 +430,7 @@ class Obol:
         out = {"budget": vars(b), "line": _budget.line(o, now) if o else "no budget set (/obol budget 20 week)"}
         if o:
             out.update(state=o.state, spent=round(o.spent, 4), period_end=o.end, forecaster=o.tier, model=o.model,
-                       projected_end_median=o.end_median, projected_end_high_pace=o.end_high,
-                       runs_out_at=o.out_median, runs_out_at_high_pace=o.out_high,
+                       expected_period_total=o.end_median, runs_out_at=o.out_median,
                        unpriced_requests=self.store.unpriced(o.start, b.provider))
         out["ephemeris_key"] = bool(self._secret(SECRET))
         if learned and learned.get("sessions"):

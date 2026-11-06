@@ -17,9 +17,9 @@ Pick what happens when the budget won't last:
 
 ```
 /obol
-Obol · $6.20 of $20 · ⚠ on track to run out ~Fri 14:00 (if busy, Thu 21:00)
+Obol · $6.20 of $20 · ⚠ on track to run out ~Fri 14:00
   weekly budget · save mode (switches to deepseek/deepseek-v4-flash)
-  forecast: Cascade 4M (local, CPU)
+  forecast: Cascade toktok 4M (local, CPU)
   last 48h  ▁▁▂▅▇▃▁▁▁▁▂▆█▅▂▁
 ```
 
@@ -63,31 +63,38 @@ Obol uses the best forecaster this machine can run, and you never need an accoun
    Toto 2 and others). Used only after you save an Ephemeris API key, which is your opt-in. Ephemeris is a
    paid service run by TensorLink, the makers of Obol; new accounts get a small free credit. Without a key,
    `/obol` shows one line saying it exists. Nothing is ever added to the agent's context about it.
-2. **Cascade 4M** (the default): a 4M-parameter time-series foundation model, bundled with the plugin
-   (13 MB) and run in plain numpy on the CPU: no GPU, no torch, no download, no account. A forecast
-   takes about 10–50 ms, so it suits a laptop, a mini PC or a Raspberry Pi-class box. It matches the
-   original PyTorch model to within 2e-6.
+2. **Cascade toktok 4M** (the default): [Cascade-toktok-4m-v1](https://huggingface.co/Tensor-Link/cascade-toktok-4m-v1),
+   a 3.3M-parameter Toto2-architecture model fine-tuned on hourly LLM token counts from coding agents and
+   chat apps. Obol forecasts your **tokens** per hour and converts to dollars at your blended price over the
+   last 7 days. Past 24 hours it averages in the base Cascade 4M model, which helps weekly totals. Both
+   ship with the plugin at half precision (13 MB together) and run in plain numpy on the CPU: no GPU, no
+   torch, no download, no account, about 20 ms a forecast. The port matches the original PyTorch models to
+   within 0.2%. It needs 128 hours of history, which the history import usually provides on install.
 3. **Seasonal** (built in, pure Python): each future hour's range comes from the same hour of day over the
-   last 7 days. It always works.
+   last 7 days. Used until there are 128 hours of history, and on machines without numpy.
 
-Forecast ranges are nominal per-hour 10–90% quantiles, not measured coverage. "At forecast pace" adds each
-hour's expected spend to what is already spent (means add up; medians don't, and run low on bursty spend). "High pace" adds the hourly 90% values, a deliberately pessimistic
-path. It is not a 90% bound on the total.
+Forecast ranges are nominal per-hour 10–90% quantiles, not measured coverage. "On track for" adds each
+remaining hour's expected spend to what is already spent. Means add up; per-hour quantiles don't (the
+model forecasts each hour on its own), so Obol never adds up 90% values to make a "worst case" total.
 
 ### How well it forecasts
 
-A backtest on 100 days of one developer's real agent spend (about $11/hour on average, 27% idle hours):
-45 daily forecast origins over the last 45 days, each from the history before it.
+From the model card: on a held-out 28 days of real coding-agent usage, toktok is about 37–40% better than
+"same hour yesterday" on CRPS and about 23% better on MASE, and strongest at 24 hours ahead.
 
-| | Pinball loss, next 24 h | Pinball loss, next 7 d | 10–90% range coverage (target 80%) | Error in the 24 h total |
-|---|---|---|---|---|
-| **Cascade 4M** | **2.95** | **3.53** | **82%** | **34%** (bias +6%) |
-| Hour-of-day seasonal | 3.70 | 4.03 | 67% | 45% (bias −14%) |
-| Yesterday repeated | 5.95 | 7.60 | 7% | 32% (bias ±) |
+A backtest on about 100 days of one developer's hourly token counts (45 daily forecast origins over the
+last 45 days, each using only the history before it; CRPS relative to "same hour yesterday" = 1.00, lower
+is better):
 
-Cascade has the lowest loss, and its ranges are calibrated. Totals over a week remain hard (about 40% median
-error): agent spend is bursty, so treat the run-out time as an early warning, not a promise. This is
-one user's data; your mileage will vary.
+| | Next 24 h | Next 7 days | Error in the 7-day total |
+|---|---|---|---|
+| **toktok, then 50/50 with base past 24 h (Obol)** | **0.60** | **0.58** | 42% |
+| toktok alone | 0.60 | 0.59 | 44% |
+| base Cascade 4M alone | 0.61 | 0.58 | 37% |
+| Same hour yesterday | 1.00 | 1.00 | |
+
+Weekly totals stay hard (about 40% median error) because agent usage is bursty, so treat the run-out time
+as an early warning, not a promise. This is one user's data, and it may overlap the model's training data.
 
 ## Install
 

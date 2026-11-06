@@ -1,4 +1,4 @@
-"""Cascade 4M (toto2-4m, bo_best) in pure numpy: no torch, no onnxruntime, runs on any CPU.
+"""Cascade 4M models (toto2-4m: Cascade-toktok-4m-v1 and the base bo_best) in pure numpy: no torch, runs on any CPU.
 
 A line-for-line port of the checkpoint's own model.py + forecast_wrapper.py decode, checked against the
 torch reference (tests/test_cascade_parity.py). Built at the trained context (4096 = 128 patches), since the
@@ -15,8 +15,13 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-WEIGHTS = HERE / "models" / "cascade-4m.safetensors"
-CONFIG = HERE / "models" / "cascade-4m.json"
+MODELS = {
+    # Cascade-toktok-4m-v1: fine-tuned on hourly LLM token counts; strongest at 24 h.
+    "toktok": (HERE / "models" / "cascade-toktok-4m-v1.f16.safetensors", HERE / "models" / "cascade-toktok-4m-v1.json"),
+    # the base Cascade 4M (bo_best); averaged in past 24 h, where it helps weekly totals.
+    "base": (HERE / "models" / "cascade-4m.f16.safetensors", HERE / "models" / "cascade-4m.json"),
+}
+WEIGHTS, CONFIG = MODELS["toktok"]
 LADDER = (4, 8, 16, 32, 64, 128)          # patches
 STABLE_DECODE_STEPS = 768
 Z_CLAMP = 64.0
@@ -31,10 +36,12 @@ def load_safetensors(path: Path) -> dict:
     for name, meta in header.items():
         if name == "__metadata__":
             continue
-        if meta["dtype"] != "F32":
+        dt = {"F32": "<f4", "F16": "<f2"}.get(meta["dtype"])
+        if dt is None:
             raise ValueError(f"{name}: unsupported dtype {meta['dtype']}")
         s, e = meta["data_offsets"]
-        out[name] = np.frombuffer(raw, dtype="<f4", count=(e - s) // 4, offset=base + s).reshape(meta["shape"])
+        a = np.frombuffer(raw, dtype=dt, count=(e - s) // np.dtype(dt).itemsize, offset=base + s)
+        out[name] = a.astype(np.float32).reshape(meta["shape"])        # stored half, computed in float32
     return out
 
 
@@ -196,11 +203,20 @@ class Cascade4M:
         return np.concatenate(out)[: int(horizon)]
 
 
-_MODEL = None
+_MODELS = {}
 
 
-def model() -> Cascade4M:
-    global _MODEL
-    if _MODEL is None:
-        _MODEL = Cascade4M()
-    return _MODEL
+def model(name: str = "toktok") -> Cascade4M:
+    if name not in _MODELS:
+        _MODELS[name] = Cascade4M(*MODELS[name])
+    return _MODELS[name]
+
+
+def forecast_tokens(history, horizon: int) -> np.ndarray:
+    """(horizon, 9) token-count quantiles: toktok alone for the first 24 h, then a 50/50 quantile average with
+    the base model (per the toktok model card; on real agent usage it tied or won at 24 h and 1 week)."""
+    q = model("toktok").quantiles(history, horizon).clip(min=0)
+    if horizon > 24:
+        b = model("base").quantiles(history, horizon).clip(min=0)
+        q[24:] = (q[24:] + b[24:]) / 2
+    return q

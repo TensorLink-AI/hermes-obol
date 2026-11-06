@@ -21,8 +21,8 @@ from pathlib import Path
 HOUR = 3600
 LEVELS = ("0.1", "0.5", "0.9")
 NINE = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]   # the run-out projection averages these
-MIN_HOURS_MODEL = 24   # measured on real spend: below a day the all-hours range edges Cascade (12 h: 3.91 vs 4.11
-                       # pinball); from 24 h Cascade wins clearly (3.66 vs 6.26). History import usually clears it.
+MIN_HOURS_MODEL = 128  # the toktok model card asks for at least 128 points (4 patches); the history import
+                       # usually clears it on install
 
 
 def _quantile(xs, q):
@@ -69,20 +69,28 @@ def cascade_status(data_dir: Path = None) -> tuple[bool, str]:
     except Exception:
         return False, "numpy isn't installed for Hermes"
     from . import _cascade
-    if not _cascade.WEIGHTS.exists():
-        return False, "Cascade 4M weights are missing from the plugin"
+    if not all(w.exists() for w, _ in _cascade.MODELS.values()):
+        return False, "Cascade model weights are missing from the plugin"
     return True, ""
 
 
-def cascade(hours, horizon, data_dir: Path = None):
+def cascade(hours, horizon, data_dir: Path = None, tokens=None, usd_per_token=None):
+    """Forecast hourly token counts with the Cascade models, then convert to dollars at the recent blended price
+    (a positive constant, so quantiles and means carry over exactly). Falls back to the dollar series itself when
+    there are no token counts to go on."""
     from . import _cascade
-    q = _cascade.model().quantiles([v for _, v in hours], horizon)
-    q = q.clip(min=0.0)
+    if tokens and usd_per_token and any(v for _, v in tokens):
+        q = _cascade.forecast_tokens([v for _, v in tokens], horizon) * usd_per_token
+        model = "Cascade toktok 4M (local, CPU)"
+        start = tokens[-1][0] + HOUR
+    else:
+        q = _cascade.forecast_tokens([v for _, v in hours], horizon)
+        model = "Cascade 4M on dollars (local, CPU)"
+        start = hours[-1][0] + HOUR
     lv = _cascade.model().levels
     pick = {f"{lv[i]:g}": i for i in range(len(lv))}
-    return {"tier": "cascade", "model": "Cascade 4M (local, CPU)", "made_at": time.time(),
-            "start": hours[-1][0] + HOUR, "quantiles": {k: q[:, pick[k]].tolist() for k in LEVELS},
-            "mean": q.mean(axis=1).tolist()}
+    return {"tier": "cascade", "model": model, "made_at": time.time(), "start": start,
+            "quantiles": {k: q[:, pick[k]].tolist() for k in LEVELS}, "mean": q.mean(axis=1).tolist()}
 
 
 # ── ephemeris (opt-in network) ───────────────────────────────────────────────
