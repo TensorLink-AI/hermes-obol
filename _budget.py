@@ -138,6 +138,12 @@ def _money(x: float) -> str:
     return f"${x:.2g}"
 
 
+def _by_end(o: Outlook) -> str:
+    """The period in words: a period ending "Mon 00:00" reads like next week's problem."""
+    days = (o.end - o.start) / 86400
+    return "today" if days < 2 else "this week" if days < 8 else "this month"
+
+
 def line(o: Outlook, now: float | None = None) -> str:
     """One plain-language status line, e.g. `$3.10 of $10 · on track to run out ~Thu 15:00`."""
     now = time.time() if now is None else now
@@ -151,5 +157,5 @@ def line(o: Outlook, now: float | None = None) -> str:
         tail = f"on track to run out ~{_when(o.out_median, now)}" if o.out_median else "on track to run out"
         return f"{head} · ⚠ {tail}"
     if st == "tight":
-        return f"{head} · close: on track for {_money(o.end_median)} by {_when(o.end, now)}"
-    return f"{head} · on track for {_money(o.end_median)} by {_when(o.end, now)}"
+        return f"{head} · close: on track for {_money(o.end_median)} {_by_end(o)}"
+    return f"{head} · on track for {_money(o.end_median)} {_by_end(o)}"

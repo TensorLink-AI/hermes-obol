@@ -40,6 +40,10 @@ Obol · $6.20 of $20 · ⚠ on track to run out ~Fri 14:00
 | `save` | Also switches to a cheaper model on the same provider, early, and tells you under the reply. |
 | `stop` | Also stops new turns, and tool calls inside a running turn, once the budget is used up. `/obol allow` sends one anyway. |
 
+`/obol demo` plays a made-up heavy week through the real forecast and rules, in a temporary ledger, so you can see
+what it does before you have any history. When a budget is short and a cheaper model is set, `/obol` also shows what
+switching would do, priced on your own recent token mix.
+
 Every setting is also on the plugin's page under Desktop → Settings → Plugins. The agent can check the budget itself
 with the `obol_budget` tool. After upgrading, restart Hermes and its gateway so the new code loads.
 

@@ -567,3 +567,36 @@ def test_tight_budget_tells_the_person(make):
     o.outlook = lambda b=None: _budget.Outlook(spent=50, usd=100, start=0, end=o.clock() + 9e4, end_median=90)
     o.pre_llm_call(session_id="s1", user_message="x")
     assert "close: on track" in o.store.meta("notice:s1")[0]
+
+
+def test_what_if_prices_your_mix_on_the_cheaper_model(make):
+    o = make({"budget_usd": 30, "period": "week", "mode": "alert", "cheap_model": "tiny",
+              "prices": {"tiny": [0.01, 0.01], "m": [10, 10]}})
+    feed(o, 40, 0.5)
+    w = o.what_if()
+    assert w and w["model"] == "tiny" and w["expected"] < o.outlook().end_median
+    assert "what if: on tiny" in _commands.run(o, "")
+
+
+def test_what_if_stays_quiet_when_it_cant_help(make):
+    o = make({"budget_usd": 3000, "cheap_model": "tiny", "prices": {"tiny": [1, 1]}})
+    feed(o, 40, 0.5)
+    assert o.what_if() is None                                  # plenty of budget
+    o.cfg["budget_usd"] = 30
+    o.cfg["cheap_model"] = "no-price-known"
+    assert o.what_if() is None
+    o.cfg["cheap_model"] = ""
+    assert o.what_if() is None
+
+
+def test_demo_saves_money_and_touches_nothing_real(make):
+    o = make({"budget_usd": 7})
+    feed(o, 3, 0.1)
+    before = (o.store.spent(0, o.clock()), o.cfg.copy())
+    out = _commands.run(o, "demo")
+    assert "made-up usage, nothing saved" in out and "switches to the cheaper model" in out
+    without = float(out.split("With no plugin: $")[1].split(",")[0])
+    limit = float(out.split("Limit $")[1].split()[0])
+    final = float(out.split("save mode: $")[1].rstrip("."))
+    assert final < limit < without
+    assert (o.store.spent(0, o.clock()), o.cfg) == before

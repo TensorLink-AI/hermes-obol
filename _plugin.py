@@ -522,6 +522,34 @@ class Obol:
             log.warning("obol: provider rejected cheap model %s; steering paused", steer["to"])
         return None
 
+    def what_if(self, b=None) -> dict | None:
+        """If the rest of this period went to the cheaper model: your last week's token mix priced on it scales the
+        remaining forecast. None unless the budget is short, the model is priced, and it would really cost less."""
+        b = b or self.budget()
+        o = self.outlook(b)
+        if o is None or o.state not in ("tight", "over"):
+            return None
+        ladder = [m.strip() for m in (b.cheap_model or "").split(",") if m.strip()]
+        target = _rules.steer_target(ladder, o.state) if ladder else None
+        if not target:
+            return None
+        now = self.clock()
+        mix = self.store.usage(now - 7 * 86400, now, b.provider)
+        usd = mix.pop("usd")
+        cost, _ = self.prices.cost(target, mix)
+        if not usd or cost is None or cost >= usd:
+            return None
+        f = self.forecast(b)
+        path = f.get("mean") or f["quantiles"].get("0.5") or []
+        scaled = dict(f, mean=[v * cost / usd if v is not None else None for v in path])
+        limit = dataclasses.replace(b, usd=o.usd)
+        new = _budget.outlook(limit, o.spent, self.store.spent(int(now // HOUR) * HOUR, now, b.provider), scaled, now)
+        if new.out_median:
+            text = f"it would run out ~{_budget._when(new.out_median, now)} instead"
+        else:
+            text = f"it would finish around {_budget._money(new.end_median)} {_budget._by_end(o)}, inside {_budget._money(o.usd)}"
+        return {"model": target, "expected": new.end_median, "runs_out_at": new.out_median, "text": text}
+
     def providers(self, days: int = 30) -> list:
         """One row per provider seen lately: spend and expected total this period, its own $/M-token price, and its
         budget's outlook when it has one. Each provider gets its own token forecast at its own price."""

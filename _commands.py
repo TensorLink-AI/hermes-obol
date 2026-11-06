@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from datetime import datetime
 
-from . import _budget, _forecast, _rules
+from . import _budget, _demo, _forecast, _rules
 
 TOOL_SCHEMA = {
     "name": "obol_budget",
@@ -28,6 +28,7 @@ MORE = """/obol cheap <model>       the cheaper model save mode switches to (sam
 /obol cap 2 | cap off     cap the current task at $2 more
 /obol providers           spend, forecast and price per API
 /obol budget 10 week openrouter   a budget for one API (0 removes it); /obol topup 5 openrouter
+/obol demo                a made-up week, to see what Obol does (nothing saved)
 /obol forecast            the next hours, hour by hour
 /obol models              spend by model this period
 /obol why                 what Obol did lately, and why
@@ -155,6 +156,8 @@ def run(obol, raw_args: str = "") -> str:
             return "\n".join(["What Obol did lately:"] + [
                 f"  {datetime.fromtimestamp(a['at']):%a %H:%M}  {a['action']:<10} ({a['rule']}) {a['detail']}"
                 for a in acts[-12:]])
+        if cmd == "demo":
+            return _demo.run(type(obol), obol.clock())
         if cmd in ("providers", "apis"):
             return _providers(obol)
         if cmd == "forecast":
@@ -174,6 +177,9 @@ def _status(obol) -> str:
     lines = [f"Obol · {s['line']}",
              f"  {_budget.ADJ[b['period']]} budget{' on ' + b['provider'] if b['provider'] else ''} · {b['mode']} mode"
              + (f" (switches to {b['cheap_model']})" if b['mode'] == 'save' and b['cheap_model'] else "")]
+    if what := obol.what_if(_budget.Budget(**b)):
+        verb = "switching" if b["mode"] == "save" else "with /obol mode save"
+        lines.append(f"  what if: on {what['model']}, {what['text']}" + ("" if b["mode"] == "save" else f" ({verb})"))
     if b["mode"] == "save" and not b["cheap_model"]:
         lines.append("  ⚠ save mode can't switch yet: pick a model with /obol cheap <model>")
     if len(s.get("budgets") or []) > 1:

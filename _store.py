@@ -166,6 +166,17 @@ class Store:
                             "WHERE session_id=? AND aux_task='' ORDER BY ts DESC LIMIT 1", (session_id,)).fetchone()
         return int(row[0]) if row and row[0] else 0
 
+    def usage(self, since: float, until: float, provider: str = "") -> dict:
+        """Tokens by kind in a window: what a request mix would cost on another model."""
+        where, args = self._scope(provider)
+        with closing(self._conn()) as c:
+            row = c.execute("SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), "
+                            "COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0), "
+                            f"COALESCE(SUM(cost_usd),0) FROM calls WHERE ts>=? AND ts<? {where}",
+                            (since, until, *args)).fetchone()
+        return {"input_tokens": row[0], "output_tokens": row[1], "cache_read_tokens": row[2],
+                "cache_write_tokens": row[3], "usd": row[4]}
+
     def by_model(self, since: float, provider: str = ""):
         where, args = self._scope(provider)
         with closing(self._conn()) as c:
