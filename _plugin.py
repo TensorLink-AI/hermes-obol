@@ -7,6 +7,7 @@ budget won't last (save), or stops new turns and tools once it is used up (stop)
 from __future__ import annotations
 
 import dataclasses
+import contextvars
 import json
 import logging
 import math
@@ -14,7 +15,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import _backfill, _budget, _forecast, _rules
+from . import _backfill, _budget, _forecast, _limits, _rules
 from ._pricing import Prices
 from ._store import HOUR, Store
 
@@ -26,6 +27,8 @@ MODEL_REFRESH = HOUR             # local model / Ephemeris: at most hourly, and 
 FAIL_BACKOFF = 3 * HOUR          # after a forecaster fails, leave it alone this long
 STEER_PAUSE = 6 * HOUR           # after the provider rejects the cheap model
 STEER_RELEASE = 0.60             # once switched, stay until the expected total is this far under the budget
+LIMITS_EVERY = 5 * 60            # at most one read of a provider's plan limits this often
+LIMITS_STALE = HOUR              # older than this, a reading is shown but not acted on
 ALLOW_FOR = HOUR                 # /obol allow: how long it waits for a turn, and how long that turn's tools run
 # Providers that serve only their own models. Routers (OpenRouter and the like) can serve anything.
 OWN_MODELS = {"anthropic": ("claude",), "openai": ("gpt", "chatgpt", "o1", "o3", "o4"), "deepseek": ("deepseek",),
@@ -43,6 +46,7 @@ class Obol:
         self.clock = clock
         self._lock = threading.Lock()
         self._refreshing = False
+        self._reading = set()
 
     # opened on first use, not in register(): the plugin probe has no profile data directory
     @property
@@ -146,6 +150,103 @@ class Obol:
             input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"),
             cache_read_tokens=usage.get("cache_read_tokens"), cache_write_tokens=usage.get("cache_write_tokens"),
             reasoning_tokens=usage.get("reasoning_tokens"), cost_usd=cost, cost_status=status)
+        if provider in _limits.PROVIDERS:
+            self.read_limits_later(provider)
+
+    # ── plan limits (Claude, Codex) ──────────────────────────────────────────
+    def _limits_on(self) -> bool:
+        return str(self._get("plan_limits", "on") or "on") != "off"
+
+    def read_limits(self, provider: str) -> dict:
+        """Read now, through Hermes's own login. A failed read keeps the last good one, and says so."""
+        now = self.clock()
+        got = _limits.read(provider)
+        old = self.store.meta(f"limits:{provider}") or {}
+        rec = {"read_at": now, "tried_at": now, "windows": got["windows"], "error": None} if not got["error"] else \
+              {"read_at": old.get("read_at"), "tried_at": now, "windows": old.get("windows") or [], "error": got["error"]}
+        self.store.set_meta(f"limits:{provider}", rec)
+        return rec
+
+    def read_limits_later(self, provider: str) -> None:
+        """Off the request path. Runs in a copy of this context: Hermes's secret scope doesn't follow into threads."""
+        if not self._limits_on() or provider in self._reading:
+            return
+        rec = self.store.meta(f"limits:{provider}") or {}
+        if self.clock() - (rec.get("tried_at") or 0) < LIMITS_EVERY:
+            return
+        self._reading.add(provider)
+
+        def run():
+            try:
+                self.read_limits(provider)
+            except Exception:
+                log.warning("obol: couldn't read %s limits", provider, exc_info=True)
+            finally:
+                self._reading.discard(provider)
+
+        threading.Thread(target=contextvars.copy_context().run, args=(run,), name="obol-limits", daemon=True).start()
+
+    def _token_path(self, provider: str):
+        """Mean tokens per hour for the next week, refreshed when a new hour of data arrives."""
+        now = self.clock()
+        tokens = self.store.hourly_tokens(until=now, provider=provider)
+        if not tokens or not any(v for _, v in tokens):
+            return None
+        key = f"tokenpath:{provider}"
+        newest = tokens[-1][0]
+        cached = self.store.meta(key)
+        if cached and cached.get("data_until") == newest:
+            return cached
+        try:
+            usable, _ = _forecast.cascade_status(self.data_dir)
+            if not usable or len(tokens) < _forecast.MIN_HOURS_MODEL:
+                raise LookupError("not enough to go on")
+            f = _forecast.cascade(tokens, 168, tokens=tokens, usd_per_token=1.0)
+        except Exception:
+            f = _forecast.seasonal(tokens, 168)
+        rec = {"data_until": newest, "start": f["start"], "mean": f["mean"], "tier": f["tier"]}
+        self.store.set_meta(key, rec)
+        return rec
+
+    def limit_windows(self, provider: str, fresh_only: bool = False) -> list:
+        """Each plan window with its projection, worst first."""
+        if not self._limits_on():
+            return []
+        rec = self.store.meta(f"limits:{provider}") or {}
+        now = self.clock()
+        if not rec.get("windows") or (fresh_only and now - (rec.get("read_at") or 0) > LIMITS_STALE):
+            return []
+        name = _limits.NAMES.get(provider, provider)
+        path = None
+        rows = []
+        for w in rec["windows"]:
+            reset, used = w.get("reset_at"), float(w["used"])
+            if reset and reset <= now:                 # it has reset since the last reading
+                continue
+            size = _limits.length(w["label"])
+            tokens_in = self.store.tokens(reset - size, now, provider) if reset and size else 0
+            if tokens_in >= _limits.MIN_TOKENS and path is None:
+                path = self._token_path(provider) or {}
+            hour = self.store.tokens(int(now // HOUR) * HOUR, now, provider)
+            p = _limits.project(used, now, reset, size, tokens_in, (path or {}).get("mean"), (path or {}).get("start"), hour)
+            st = _limits.state(used, p["expected"])
+            rows.append(dict(w, provider=provider, name=f"{name} {w['label'].lower()}", state=st, **p,
+                             line=self._window_line(name, w["label"], used, reset, p, st, now)))
+        return _limits.worst_first(rows)
+
+    @staticmethod
+    def _window_line(name, label, used, reset, p, st, now) -> str:
+        when = _budget._when
+        head = f"{name} {label.lower()}: {used:.0f}% used"
+        until = f"resets {when(reset, now)}" if reset else "reset time unknown"
+        if st == "out":
+            return f"{head} · limit reached, {until}"
+        if st == "over" and p["out_at"]:
+            return f"{head} · ⚠ on track to hit the limit ~{when(p['out_at'], now)}, before it {until}"
+        if p["expected"] is None:
+            return f"{head} · {until}"
+        prefix = "close: " if st == "tight" else ""
+        return f"{head} · {prefix}on track for {p['expected']:.0f}% before it {until}"
 
     # ── forecast ─────────────────────────────────────────────────────────────
     def forecast(self, b: _budget.Budget | None = None) -> dict | None:
@@ -304,15 +405,26 @@ class Obol:
                 continue
             key = (_rules.SEVERITY.get(o.state, 0), -(o.out_median or float("inf")))
             if worst is None or key > worst[0]:
-                worst = (key, bb, o)
+                line = _budget.line(o, now)
+                worst = (key, dict(
+                    state=o.state if o.state != "unknown" else "ok", spent_pct=100 * o.spent / o.usd if o.usd > 0 else None,
+                    runs_out_in=(o.out_median - now) if o.out_median else None,
+                    line=f"{self.label(bb)}: {line}" if many else line, budget_provider=bb.provider,
+                    limit={"spent": o.spent, "usd": o.usd, "end": o.end, "period": bb.period, "provider": bb.provider,
+                           "expected": o.end_median}))
+        for w in self.limit_windows(provider, fresh_only=True) if provider in _limits.PROVIDERS else []:
+            # A model-scoped window (Opus week) only ever speaks for that model.
+            if w.get("scope") == "model" and w["label"].split()[0].lower() not in (model or "").lower():
+                continue
+            key = (_rules.SEVERITY.get(w["state"], 0), -(w["out_at"] or float("inf")))
+            if worst is None or key > worst[0]:
+                worst = (key, dict(
+                    state=w["state"], spent_pct=w["used"], runs_out_in=(w["out_at"] - now) if w["out_at"] else None,
+                    line=w["line"], budget_provider=f"{provider}:{w['label']}",
+                    limit={"spent": w["used"], "usd": 100.0, "end": w["reset_at"] or now, "period": "", "provider": provider,
+                           "expected": w["expected"], "window": w["name"]}))
         if worst:
-            _, bb, o = worst
-            line = _budget.line(o, now)
-            ctx.update(state=o.state if o.state != "unknown" else "ok", spent_pct=100 * o.spent / o.usd if o.usd > 0 else None,
-                       runs_out_in=(o.out_median - now) if o.out_median else None,
-                       line=f"{self.label(bb)}: {line}" if many else line, budget_provider=bb.provider,
-                       limit={"spent": o.spent, "usd": o.usd, "end": o.end, "period": bb.period, "provider": bb.provider,
-                              "expected": o.end_median})
+            ctx.update(worst[1])
         job = self.store.meta("job_cap")
         if job:
             used = self.store.spent(job["since"], now, "")
@@ -421,6 +533,9 @@ class Obol:
         if not lim:
             return (f"Obol: {ctx['line'] or 'stopped by your rule'}. /obol cap off removes the cap, /obol allow sends "
                     "this one message, /obol pause 1h stops Obol acting for a while.")
+        if lim.get("window"):
+            return (f"Obol: {ctx['line']}. /obol allow sends this one message, /obol mode alert stops blocking. "
+                    "A plan limit can't be topped up from here.")
         name = f"{_budget.ADJ[lim['period']]} {lim['provider'] + ' ' if lim['provider'] else ''}limit"
         over = lim["spent"] - lim["usd"]
         need = math.ceil(max(over, 0)) + max(1, math.ceil(lim["usd"] * 0.25))
@@ -617,6 +732,7 @@ class Obol:
         rows.sort(key=lambda r: (_rules.SEVERITY.get(r[1].state, 0), -(r[1].out_median or float("inf"))), reverse=True)
         b, o = rows[0] if rows else (self.budget(), None)
         out = {"budget": vars(b), "line": _budget.line(o, now) if o else "no budget set (/obol budget 20 week)"}
+        out["limits"] = [w for p in _limits.PROVIDERS for w in self.limit_windows(p)]
         if o:
             out.update(state=o.state, spent=round(o.spent, 4), period_end=o.end, forecaster=o.tier, model=o.model,
                        expected_period_total=o.end_median, runs_out_at=o.out_median,

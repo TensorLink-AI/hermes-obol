@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from datetime import datetime
 
-from . import _budget, _demo, _forecast, _rules
+from . import _budget, _demo, _forecast, _limits, _rules
 
 TOOL_SCHEMA = {
     "name": "obol_budget",
@@ -19,6 +19,7 @@ HELP = """/obol                     how you're doing
     alert: tell you and the agent when the budget won't last (default)
     save:  also switch to a cheaper model when it won't last (set it with /obol cheap <model>)
     stop:  also stop new turns once it's used up
+/obol limits              Claude and Codex plan limits: will they last until they reset?
 /obol topup 5             add $5 to this period
 /obol pause 2h            take a break from Obol acting (spend is still recorded)
 /obol more                everything else"""
@@ -156,6 +157,8 @@ def run(obol, raw_args: str = "") -> str:
             return "\n".join(["What Obol did lately:"] + [
                 f"  {datetime.fromtimestamp(a['at']):%a %H:%M}  {a['action']:<10} ({a['rule']}) {a['detail']}"
                 for a in acts[-12:]])
+        if cmd in ("limits", "limit", "plan"):
+            return _limits_view(obol)
         if cmd == "demo":
             return _demo.run(type(obol), obol.clock())
         if cmd in ("providers", "apis"):
@@ -173,7 +176,7 @@ def _status(obol) -> str:
     s = obol.status()
     b = s["budget"]
     if "state" not in s:
-        return _no_budget(obol, s)
+        return "\n".join([_no_budget(obol, s)] + [f"  {w['line']}" for w in s["limits"][:3]])
     lines = [f"Obol · {s['line']}",
              f"  {_budget.ADJ[b['period']]} budget{' on ' + b['provider'] if b['provider'] else ''} · {b['mode']} mode"
              + (f" (switches to {b['cheap_model']})" if b['mode'] == 'save' and b['cheap_model'] else "")]
@@ -182,6 +185,7 @@ def _status(obol) -> str:
         lines.append(f"  what if: on {what['model']}, {what['text']}" + ("" if b["mode"] == "save" else f" ({verb})"))
     if b["mode"] == "save" and not b["cheap_model"]:
         lines.append("  ⚠ save mode can't switch yet: pick a model with /obol cheap <model>")
+    lines += [f"  {w['line']}" for w in s["limits"][:3]]
     if len(s.get("budgets") or []) > 1:
         for r in s["budgets"]:
             lines.append(f"  {r['label']}: {r['line']}")
@@ -244,6 +248,23 @@ def _no_budget(obol, s) -> str:
     if lr and lr.get("sessions"):
         lines.append(f"  learned from {lr['sessions']} past Hermes sessions")
     return "\n".join(lines)
+
+
+def _limits_view(obol) -> str:
+    """Reads now, so it's current whenever you ask."""
+    if not obol._limits_on():
+        return "Plan limits are off (the `plan_limits` setting)."
+    lines, why = [], []
+    for p in _limits.PROVIDERS:
+        rec = obol.read_limits(p)
+        rows = obol.limit_windows(p)
+        lines += [f"  {w['line']}" + (" (at your pace so far)" if w["how"] == "pace" else "") for w in rows]
+        if rec.get("error"):
+            why.append(f"  {_limits.NAMES[p]}: {rec['error']}")
+    if not lines and not why:
+        return "No plan limits to show."
+    return "\n".join((["Plan limits (the vendor's figures, across every client on the account):"] + lines if lines
+                      else ["No plan limits to show."]) + why)
 
 
 def _providers(obol) -> str:

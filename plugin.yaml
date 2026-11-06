@@ -45,6 +45,12 @@ config_schema:
     default: ""
     label: "Cheaper model"
     description: "What save mode switches to, on the same provider (e.g. deepseek/deepseek-v4-flash on OpenRouter). Several, comma-separated, make a ladder"
+  plan_limits:
+    type: str
+    choices: ["on", "off"]
+    default: "on"
+    label: "Advanced · read Claude and Codex plan limits"
+    description: "Through Hermes's own login, at most every 5 minutes, only while you use that provider"
   budgets:
     type: list
     default: []

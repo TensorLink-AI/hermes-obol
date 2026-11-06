@@ -2,7 +2,8 @@
 
 **Know when you're going to run out of tokens, before it happens.**
 
-Obol forecasts your token use hour by hour and tells you when, at this pace, your budget runs out. It can warn you,
+Obol forecasts your token use hour by hour and tells you when, at this pace, your budget or your Claude or Codex plan
+limit runs out. It can warn you,
 switch to a cheaper model, or stop at the limit.
 
 ```sh
@@ -24,7 +25,7 @@ Restart Hermes (and its local gateway, `hermes gateway restart`), then in any se
 
 The forecast comes from a small model that runs on your CPU, offline. It learns from your Hermes history when you
 install it, so it works from day one, and it acts while there's still budget left. Budgets are in dollars, for API
-usage; Obol doesn't read subscription quota windows.
+usage, and on Claude or Codex plans it forecasts the plan's own limits.
 
 ```
 /obol
@@ -53,6 +54,23 @@ with the `obol_budget` tool. After upgrading, restart Hermes and its gateway so 
 
 `/obol budget off` removes the limit, `/obol pause 2h` takes a break, `hermes plugins disable obol` turns it off and
 `hermes plugins remove obol` uninstalls it.
+
+## Claude and Codex plans
+
+If you're signed in to Hermes with a Claude or Codex plan, `/obol limits` shows each window and whether it fills
+before it resets. No budget or setup needed, and the alerts and modes above apply to these too:
+
+```
+/obol limits
+Plan limits (the vendor's figures, across every client on the account):
+  Claude current session: 62% used · ⚠ on track to hit the limit ~15:20, before it resets 16:00
+  Claude current week: 41% used · on track for 73% before it resets Mon 09:00
+```
+
+The percentages come from the vendor, so they include your use outside Hermes. The projection scales the token
+forecast by how much of the window each Hermes token has used so far, and falls back to your pace so far when most of
+the use came from somewhere else. It's a forecast, so treat the time as an early warning. Obol uses the sign-in
+Hermes holds, so a login that only exists in Claude Code or the Codex CLI isn't seen.
 
 ## Several APIs
 
@@ -143,6 +161,8 @@ Weekly totals stay hard (about 40% median error) because agent usage is bursty, 
 as an early warning, not a promise. This is one user's data, and it may overlap the model's training data.
 
 ## Disclosure
+
+**Plan limits.** While you use a Claude or Codex plan, at most every 5 minutes (and when you run `/obol limits`), Obol asks Hermes for that login's limits with `agent.account_usage.fetch_account_usage(read_only=True)`. Hermes makes the request to the vendor with the credential it already holds; Obol never sees the credential, and stores only the window names, percentages and reset times. Turn it off with the `plan_limits` setting.
 
 - **What it reads:** the token counts and model of each provider request, from Hermes's
   `post_api_request` and `post_auxiliary_call` hooks. It never reads prompt or reply text. Cost comes from

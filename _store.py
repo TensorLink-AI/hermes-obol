@@ -177,6 +177,10 @@ class Store:
         return {"input_tokens": row[0], "output_tokens": row[1], "cache_read_tokens": row[2],
                 "cache_write_tokens": row[3], "usd": row[4]}
 
+    def tokens(self, since: float, until: float, provider: str = "") -> int:
+        u = self.usage(since, until, provider)
+        return int(u["input_tokens"] + u["output_tokens"] + u["cache_read_tokens"] + u["cache_write_tokens"])
+
     def by_model(self, since: float, provider: str = ""):
         where, args = self._scope(provider)
         with closing(self._conn()) as c:

@@ -623,3 +623,131 @@ def test_demo_doesnt_flip_flop_on_either_forecaster(make, monkeypatch):
             monkeypatch.setattr(_forecast, "cascade_status", lambda *a, **k: (False, "no numpy"))
         out = _commands.run(o, "demo")
         assert out.count("→") <= 4, out
+
+
+# ── plan limits ──────────────────────────────────────────────────────────────
+
+def _plan(o, monkeypatch, used=60.0, reset_in=2 * HOUR, label="Current session", scope="account", provider="anthropic"):
+    from obol import _limits
+    rows = [{"label": label, "used": used, "scope": scope, "reset_at": o.clock() + reset_in}]
+    monkeypatch.setattr(_limits, "read", lambda p: {"windows": rows if p == provider else [], "error": None if p == provider else "not signed in to Hermes"})
+    return o.read_limits(provider)
+
+
+def test_project_scales_the_forecast_by_the_windows_own_rate():
+    from obol import _limits
+    now = 3600.0 * 1000
+    # 50% used on 100k tokens; 100k more forecast before the reset: reaches 100 at the end of the second hour
+    p = _limits.project(50, now, now + 4 * HOUR, 5 * HOUR, 100_000, [50_000] * 4, now)
+    assert p["how"] == "forecast" and p["expected"] == 150
+    assert p["out_at"] == now + 2 * HOUR
+    assert _limits.state(50, p["expected"]) == "over"
+
+
+def test_project_counts_only_the_part_of_the_last_hour_inside_the_window():
+    from obol import _limits
+    now = 3600.0 * 1000
+    p = _limits.project(50, now, now + 1.5 * HOUR, 5 * HOUR, 100_000, [10_000] * 4, now)
+    assert p["expected"] == pytest.approx(50 + 7.5)
+
+
+def test_use_from_other_clients_falls_back_to_pace():
+    from obol import _limits
+    now = 3600.0 * 1000
+    p = _limits.project(40, now, now + 3 * HOUR, 5 * HOUR, 200, [10_000] * 4, now)
+    assert p["how"] == "pace" and p["expected"] == pytest.approx(100)
+    early = _limits.project(1, now, now + 4.99 * HOUR, 5 * HOUR, 0, None, None)
+    assert early["expected"] is None and _limits.state(1, early["expected"]) == "ok"
+
+
+def test_window_lengths():
+    from obol import _limits
+    assert _limits.length("Current session") == 5 * HOUR and _limits.length("Current week") == 7 * 86400
+    assert _limits.length("Opus week") == 7 * 86400 and _limits.length("Mystery") is None
+
+
+def test_plan_limit_warns_with_no_budget_and_only_that_provider(make, monkeypatch):
+    o = make({"unusual_day_x": 0})
+    feed(o, 1, 0.1, provider="anthropic", session="a")
+    feed(o, 1, 0.1, provider="openrouter", session="b")
+    o.store.add_call(ts=o.clock() - 60, session_id="a", provider="anthropic", input_tokens=100_000)
+    _plan(o, monkeypatch, used=70, reset_in=4 * HOUR)
+    o._token_path = lambda p: {"start": o.clock(), "mean": [100_000] * 8}
+    told = o.pre_llm_call(session_id="a", user_message="x")
+    assert "Claude current session" in told["context"] and "hit the limit" in told["context"]
+    assert o.pre_llm_call(session_id="b", user_message="x") is None
+
+
+def test_plan_limit_reached_stops_in_stop_mode_with_a_way_out(make, monkeypatch):
+    o = make({"mode": "stop"})
+    o.store.add_call(ts=o.clock() - 60, session_id="a", provider="anthropic", input_tokens=10)
+    _plan(o, monkeypatch, used=100)
+    msg = o.pre_llm_call(session_id="a", user_message="x")["message"]
+    assert "limit reached" in msg and "/obol allow" in msg and "topup" not in msg.replace("topped up", "")
+    _commands.run(o, "allow")
+    assert "action" not in (o.pre_llm_call(session_id="a", user_message="x") or {})
+
+
+def test_model_window_only_speaks_for_that_model(make, monkeypatch):
+    o = make({"mode": "stop"})
+    o.store.add_call(ts=o.clock() - 60, session_id="a", provider="anthropic", model="claude-opus-5", input_tokens=10)
+    _plan(o, monkeypatch, used=100, label="Opus week", scope="model", reset_in=86400)
+    assert o.pre_llm_call(session_id="a", user_message="x", model="claude-opus-5")["action"] == "block"
+    assert o.pre_llm_call(session_id="a", user_message="x", model="claude-sonnet-5") is None
+
+
+def test_stale_or_passed_readings_arent_acted_on(make, monkeypatch):
+    o = make({"mode": "stop"})
+    o.store.add_call(ts=o.clock() - 60, session_id="a", provider="anthropic", input_tokens=10)
+    _plan(o, monkeypatch, used=100, reset_in=30 * HOUR)
+    o.clock_obj.t += 2 * HOUR
+    assert o.pre_llm_call(session_id="a", user_message="x") is None      # old reading
+    assert "limit reached" in _commands.run(o, "").replace("\n", " ")   # still shown
+    _plan(o, monkeypatch, used=100, reset_in=HOUR)
+    o.clock_obj.t += 2 * HOUR
+    assert o.limit_windows("anthropic") == []                            # it has reset
+
+
+def test_limits_command_reads_now_and_says_why_not(make, monkeypatch):
+    o = make()
+    _plan(o, monkeypatch, used=30, reset_in=4 * HOUR)
+    out = _commands.run(o, "limits")
+    assert "Claude current session: 30% used" in out and "Codex: not signed in" in out
+    o.cfg["plan_limits"] = "off"
+    assert "off" in _commands.run(o, "limits")
+    assert o.limit_windows("anthropic") == []
+
+
+def test_limits_are_read_in_the_background_and_throttled_only_for_those_providers(make, monkeypatch):
+    from obol import _limits
+    o = make()
+    seen = []
+    monkeypatch.setattr(_limits, "read", lambda p: (seen.append(p), {"windows": [], "error": None})[1])
+    started = []
+
+    class NowThread:
+        def __init__(self, target, args=(), **k):
+            self.go = lambda: target(*args)
+
+        def start(self):
+            started.append(1)
+            self.go()
+    monkeypatch.setattr(_plugin.threading, "Thread", NowThread)
+    use = {"input_tokens": 10}
+    o.meter(session_id="s", provider="openrouter", model="m", usage=use)
+    assert seen == []
+    o.meter(session_id="s", provider="anthropic", model="m", usage=use)
+    o.meter(session_id="s", provider="anthropic", model="m", usage=use)
+    assert seen == ["anthropic"]
+    o.clock_obj.t += 600
+    o.meter(session_id="s", provider="anthropic", model="m", usage=use)
+    assert seen == ["anthropic", "anthropic"]
+
+
+def test_failed_read_keeps_the_last_good_one(make, monkeypatch):
+    from obol import _limits
+    o = make()
+    _plan(o, monkeypatch, used=30, reset_in=4 * HOUR)
+    monkeypatch.setattr(_limits, "read", lambda p: {"windows": [], "error": "couldn't read it (HTTPStatusError)"})
+    rec = o.read_limits("anthropic")
+    assert rec["windows"] and rec["error"]
