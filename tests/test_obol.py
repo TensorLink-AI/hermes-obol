@@ -684,6 +684,7 @@ def test_plan_limit_warns_with_no_budget_and_only_that_provider(make, monkeypatc
 def test_plan_limit_reached_stops_in_stop_mode_with_a_way_out(make, monkeypatch):
     o = make({"mode": "stop"})
     o.store.add_call(ts=o.clock() - 60, session_id="a", provider="anthropic", input_tokens=10)
+    _plan(o, monkeypatch, used=90)
     _plan(o, monkeypatch, used=100)
     msg = o.pre_llm_call(session_id="a", user_message="x")["message"]
     assert "limit reached" in msg and "/obol allow" in msg and "topup" not in msg.replace("topped up", "")
@@ -694,6 +695,7 @@ def test_plan_limit_reached_stops_in_stop_mode_with_a_way_out(make, monkeypatch)
 def test_model_window_only_speaks_for_that_model(make, monkeypatch):
     o = make({"mode": "stop"})
     o.store.add_call(ts=o.clock() - 60, session_id="a", provider="anthropic", model="claude-opus-5", input_tokens=10)
+    _plan(o, monkeypatch, used=90, label="Opus week", scope="model", reset_in=86400)
     _plan(o, monkeypatch, used=100, label="Opus week", scope="model", reset_in=86400)
     assert o.pre_llm_call(session_id="a", user_message="x", model="claude-opus-5")["action"] == "block"
     assert o.pre_llm_call(session_id="a", user_message="x", model="claude-sonnet-5") is None
@@ -702,6 +704,7 @@ def test_model_window_only_speaks_for_that_model(make, monkeypatch):
 def test_stale_or_passed_readings_arent_acted_on(make, monkeypatch):
     o = make({"mode": "stop"})
     o.store.add_call(ts=o.clock() - 60, session_id="a", provider="anthropic", input_tokens=10)
+    _plan(o, monkeypatch, used=90, reset_in=30 * HOUR)
     _plan(o, monkeypatch, used=100, reset_in=30 * HOUR)
     o.clock_obj.t += 2 * HOUR
     assert o.pre_llm_call(session_id="a", user_message="x") is None      # old reading
@@ -765,10 +768,12 @@ def test_snapshot_shows_the_closest_to_running_out(make, monkeypatch):
     assert s["state"] == "over" and s["chip"].startswith("$20.00/$30") and " · out " in s["chip"]
     assert s["chart"]["limit"] == 30 and s["chart"]["actual"][-1][1] == s["chart"]["expected"][0][1]
     assert s["chart"]["expected"][-1][1] >= 30
+    _plan(o, monkeypatch, used=90, reset_in=HOUR)
     _plan(o, monkeypatch, used=100, reset_in=HOUR)
     s = o.desktop_snapshot()
     assert s["state"] == "out" and s["chip"] == "Claude current session 100% · used up"
-    assert s["chart"] and len(s["lines"]) == 2
+    assert s["chart"]["unit"] == "%" and s["chart"]["limit"] == 100 and len(s["lines"]) == 2
+    assert [v for _, v in s["chart"]["actual"]] == [0.0, 90.0, 100.0, 100.0]
 
 
 def test_snapshot_with_nothing_set_up(make):
@@ -804,3 +809,66 @@ def test_snapshot_is_written_for_the_backend_and_throttled(make, tmp_path):
     o.clock_obj.t += 60
     o.write_desktop(every=60)
     assert json.loads((o._data_dir / "desktop.json").read_text())["state"]
+
+
+def test_a_sudden_claude_100_is_read_as_1_until_the_window_has_climbed():
+    from obol import _limits
+    w = {"label": "Current session", "used": 100.0, "scope": "account", "reset_at": 5000.0}
+    assert _limits.settle("anthropic", [w], [])[0]["used"] == 1.0
+    assert _limits.settle("anthropic", [w], [dict(w, used=1.0)])[0]["used"] == 1.0
+    assert _limits.settle("anthropic", [w], [dict(w, used=90.0)])[0]["used"] == 100.0
+    assert _limits.settle("anthropic", [w], [dict(w, used=90.0, reset_at=90000.0)])[0]["used"] == 1.0   # an older window
+    assert _limits.settle("openai-codex", [w], [])[0]["used"] == 100.0
+
+
+def test_a_false_100_saved_by_an_older_version_is_ignored_and_cant_vouch(make, monkeypatch):
+    o = make({"mode": "stop"})
+    reset = o.clock() + 3600
+    o.store.set_meta("limits:anthropic", {"read_at": o.clock(), "tried_at": o.clock(), "error": None, "windows": [
+        {"label": "Current session", "used": 100.0, "scope": "account", "reset_at": reset}]})
+    assert o.limit_windows("anthropic") == []
+    _plan(o, monkeypatch, used=100, reset_in=3600)
+    assert o.limit_windows("anthropic")[0]["used"] == 1.0
+
+
+def test_plan_window_chart_runs_from_its_readings_to_the_forecast(make, monkeypatch):
+    o = make()
+    _plan(o, monkeypatch, used=30, reset_in=2 * HOUR)
+    s = o.desktop_snapshot()
+    c = s["chart"]
+    assert c["title"] == "Claude current session" and c["end"] - c["start"] == 5 * HOUR
+    assert c["actual"][-1] == c["expected"][0] and c["expected"][-1][0] == c["end"] and c["expected"][-1][1] == 50
+    assert s["forecast"] == "your pace so far"
+    assert all("path" not in w for w in o.limit_windows("anthropic"))     # kept out of what the agent is told
+
+
+def test_a_window_that_resets_starts_a_new_log():
+    from obol import _limits
+    w = {"label": "Current week", "used": 10.0, "reset_at": 1000.0}
+    log = _limits.remember({}, [w], 1.0)
+    log = _limits.remember(log, [dict(w, used=20.0)], 2.0)
+    assert log["Current week"]["points"] == [[1.0, 10.0], [2.0, 20.0]]
+    assert _limits.remember(log, [dict(w, used=1.0, reset_at=90000.0)], 3.0)["Current week"]["points"] == [[3.0, 1.0]]
+
+
+def test_spread_comes_from_past_stretches_and_needs_four():
+    now, week = 1000 * HOUR, 7 * 24 * HOUR
+    def history(weeks):
+        return [(now - k * week + i * HOUR, 1.0 + k) for k in range(1, weeks + 1) for i in range(168)]
+    assert _forecast.spread(history(3), now, now + week) is None
+    low, high = _forecast.spread(history(5), now, now + week)
+    assert low < 1 < high
+    b = _forecast.band([[0, 10.0], [1, 20.0]], (low, high))
+    assert b["low"][0] == b["high"][0] == [0, 10.0] and b["low"][1][1] < 20 < b["high"][1][1]
+    assert _forecast.band([[0, 10.0]], None) == {}
+
+
+def test_demo_draws_the_week_and_labels_the_chip(make):
+    o = make({"budget_usd": 50})
+    out = _commands.run(o, "demo")
+    assert "What Obol saw on" in out and "█" in out and "░" in out and "over the limit" in out
+    s = o.desktop_snapshot()
+    assert s["state"] == "demo" and s["chip"].startswith("Demo · ") and "Made-up" in s["lines"][0]
+    assert s["chart"]["expected"][-1][1] > s["chart"]["limit"] and s["chart"]["high"]
+    o.store.set_meta("demo_chip", {"until": o.clock() - 1, "snapshot": s})
+    assert o.desktop_snapshot()["state"] != "demo"

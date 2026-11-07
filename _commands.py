@@ -160,7 +160,7 @@ def run(obol, raw_args: str = "") -> str:
         if cmd in ("limits", "limit", "plan"):
             return _limits_view(obol)
         if cmd == "demo":
-            return _demo.run(type(obol), obol.clock())
+            return _demo.run(type(obol), obol.clock(), obol.show_demo)
         if cmd in ("providers", "apis"):
             return _providers(obol)
         if cmd == "forecast":

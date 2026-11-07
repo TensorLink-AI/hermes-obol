@@ -36,6 +36,31 @@ def read(provider: str) -> dict:
     return {"windows": rows, "error": None}
 
 
+def settle(provider: str, rows: list, old_rows: list) -> list:
+    """Correct a false "100%" on Claude windows. Hermes scales any figure of 1 or less up by 100, so 1% used arrives
+    as 100%. Believe 100 only if the same window was already at 50 or more; a real 100 then still shows on the climb,
+    and if it was missed the vendor's own refusal says so."""
+    if provider != "anthropic":
+        return rows
+
+    def climbed(w):
+        return any(o.get("label") == w["label"] and float(o.get("used") or 0) >= 50
+                   and abs((o.get("reset_at") or 0) - (w.get("reset_at") or 0)) < 300 for o in old_rows)
+
+    return [dict(w, used=1.0) if w["used"] == 100 and not climbed(w) else w for w in rows]
+
+
+def remember(log: dict, windows: list, now: float) -> dict:
+    """Each window's readings so far, so a chart can draw what really happened. Starts over when a window resets."""
+    out = {}
+    for w in windows:
+        reset, old = w.get("reset_at"), log.get(w["label"]) or {}
+        same = abs((old.get("reset") or 0) - (reset or 0)) < 300
+        points = (old.get("points") or [] if same else []) + [[now, w["used"]]]
+        out[w["label"]] = {"reset": reset, "points": points[::2] if len(points) > 200 else points}
+    return out
+
+
 def length(label: str) -> float | None:
     """A window's length, from its name: the vendors report when it resets, not how long it is."""
     text = (label or "").lower()
@@ -52,12 +77,14 @@ def length(label: str) -> float | None:
 
 def project(used: float, now: float, reset_at: float | None, size: float | None, tokens_in: float,
             path: list | None, path_start: float | None, tokens_this_hour: float = 0.0) -> dict:
-    """{"expected": percent at reset or None, "out_at": when it reaches 100 or None, "how": "forecast"|"pace"|""}."""
-    out = {"expected": None, "out_at": None, "how": ""}
+    """{"expected": percent at reset or None, "out_at": when it reaches 100 or None, "how": "forecast"|"pace"|"",
+    "path": [[time, percent]] from now to the reset}."""
+    out = {"expected": None, "out_at": None, "how": "", "path": []}
     if used >= 100 or not reset_at or reset_at <= now:
         return out
     if path and path_start is not None and tokens_in >= MIN_TOKENS and used > 0:
         rate, total, current = used / tokens_in, used, int(now // HOUR) * HOUR
+        out["path"].append([now, round(total, 2)])
         for i, tok in enumerate(path):
             h = path_start + i * HOUR
             if tok is None or h + HOUR <= now:
@@ -71,6 +98,7 @@ def project(used: float, now: float, reset_at: float | None, size: float | None,
             if out["out_at"] is None and total + add >= 100 > total and add > 0:
                 out["out_at"] = max(now, h) + (min(h + HOUR, reset_at) - max(now, h)) * (100 - total) / add
             total += add
+            out["path"].append([min(h + HOUR, reset_at), round(total, 2)])
         out.update(expected=total, how="forecast")
         return out
     if size:
@@ -78,7 +106,7 @@ def project(used: float, now: float, reset_at: float | None, size: float | None,
         if elapsed >= MIN_ELAPSED * size and used > 0:
             per_second = used / elapsed
             expected = used + per_second * (reset_at - now)
-            out.update(expected=expected, how="pace")
+            out.update(expected=expected, how="pace", path=[[now, round(used, 2)], [reset_at, round(expected, 2)]])
             if expected >= 100:
                 out["out_at"] = now + (100 - used) / per_second
     return out

@@ -25,8 +25,12 @@ console.log('server render (effects do not run):', JSON.stringify(renderToString
 writeFileSync('plugin_parts.mjs', readFileSync('plugin_under_test.mjs', 'utf8') + '\nexport { Details, Chip }\n')
 const parts = await import(pathToFileURL(resolve('plugin_parts.mjs')))
 const data = { state: 'over', chip: '$6.20/$20 · out Fri 14:00', forecast: 'Cascade', lines: ['$6.20 of $20 · ⚠ on track to run out ~Fri 14:00'],
-  chart: { start: 0, end: 100, limit: 20, actual: [[0, 0], [40, 6.2]], expected: [[40, 6.2], [90, 22]] } }
+  chart: { title: 'This week', unit: '$', start: 0, end: 100, limit: 20, out_at: 85, actual: [[0, 0], [40, 6.2]],
+           expected: [[40, 6.2], [90, 22]], low: [[40, 6.2], [90, 18]], high: [[40, 6.2], [90, 26]] } }
 const html = renderToString(jsx(parts.Details, { data }))
-for (const want of ['<svg', 'on track to run out', 'stroke-dasharray', 'Type /obol']) if (!html.includes(want)) throw new Error('missing ' + want)
+for (const want of ['<svg', '<polygon', 'out ', 'resets ', 'Shaded', 'on track to run out', 'stroke-dasharray', 'Type /obol']) if (!html.includes(want)) throw new Error('missing ' + want)
 renderToString(jsx(parts.Details, { data: { state: 'none', chip: 'Obol', lines: ['x'] } }))
+const plan = renderToString(jsx(parts.Details, { data: { state: 'out', chip: 'x', lines: ['x'], chart: { title: 'w', unit: '%', start: 0, end: 100,
+  limit: 100, actual: [[0, 0], [50, 100]], expected: [], out_at: null } } }))
+if (!plan.includes('100%') || plan.includes('<polygon')) throw new Error('bad plan chart')
 console.log('ok')

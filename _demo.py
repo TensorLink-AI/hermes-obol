@@ -1,8 +1,9 @@
 """/obol demo: a made-up week, run through the real forecast and rules, in a temporary ledger.
 
-Nothing about your own usage is read and nothing is saved. Three quiet weeks, then a heavy one, with a budget a
-little above a usual week. The week plays out twice from the same usage: once as it would with no plugin, and once
-with Obol deciding every few working hours, so the difference is what save mode actually did.
+Nothing about your own usage is read or saved. Five ordinary weeks, then a heavy one, with a budget a little above a
+usual week. The week plays out twice from the same usage: once as it would with no plugin, and once with Obol deciding
+every few working hours, so the difference is what save mode actually did. The moment Obol first sees the week running
+out is drawn in the reply, and on the Desktop chip for a few minutes, labelled as made up.
 """
 from __future__ import annotations
 
@@ -18,6 +19,8 @@ PRICES = {BIG: [3.0, 15.0, 0.3, 3.75], SMALL: [0.14, 0.28, 0.014, 0.14]}    # $ 
 WORK_HOURS = range(9, 18)
 CHECK_HOURS = (9, 12, 15)
 HEAVY = 1.7                     # this week's usage against a usual one
+WEEKS = 5                       # ordinary weeks before it: enough for the chart's range of how weeks vary
+BAR = 20                        # characters that stand for the whole limit
 
 
 def _usage(rng, scale=1.0) -> dict:
@@ -34,7 +37,28 @@ def _working(start: float, end: float):
             yield h
 
 
-def run(obol_cls, now: float) -> str:
+def _bars(chart: dict) -> list:
+    """The week as text, for chats that can't draw: solid is spent, light is what the forecast expected next."""
+    now, limit, rows, over = chart["actual"][-1][0], chart["limit"], [], False
+    for d in range(7):
+        end = chart["start"] + (d + 1) * 86400
+        spent = [v for t, v in chart["actual"] if t <= end][-1]
+        ahead = [v for t, v in chart["expected"] if t <= end]
+        value = ahead[-1] if ahead and end > now else spent
+        solid, light = round(spent / limit * BAR), round(max(0.0, value - spent) / limit * BAR)
+        note = "  ← over the limit" if value > limit and not over else ""
+        over = over or value > limit
+        day = datetime.fromtimestamp(end - 43200)
+        rows.append(f"  {day:%a} {'█' * solid}{'░' * light} {_budget._money(value)}{note}")
+    return rows
+
+
+def _chip(snapshot: dict) -> dict:
+    return dict(snapshot, state="demo", chip=f"Demo · {snapshot['chip']}", lines=[
+        "Made-up usage from /obol demo. Your real numbers come back in 5 minutes.", *snapshot["lines"][:1]])
+
+
+def run(obol_cls, now: float, show=None) -> str:
     rng = random.Random(7)
     monday, sunday = _budget.period_bounds("week", now)
     settings = {"mode": "save", "cheap_model": SMALL, "prices": PRICES, "unusual_day_x": 0}
@@ -45,20 +69,23 @@ def run(obol_cls, now: float) -> str:
         o.prices.stale = lambda now=None: False            # no price fetch
         o.store.set_meta("history_imported", {"sessions": 0})   # and no reading of the real history
         rows = []
-        for h in _working(monday - 21 * 86400, monday):
-            usage = _usage(rng)
+        week_scale = {}
+        for h in _working(monday - WEEKS * 7 * 86400, monday):
+            usage = _usage(rng, week_scale.setdefault((monday - h) // (7 * 86400), rng.uniform(0.8, 1.2)))
             rows.append(dict(ts=h + 600, session_id="demo", platform="demo", provider="demo", model=BIG, aux_task="",
                              reasoning_tokens=0, cost_usd=o.prices.cost(BIG, usage)[0], cost_status="estimated", **usage))
         o.store.add_calls(rows)
         o.store.set_meta("first_call_at", rows[0]["ts"])
-        usual = sum(r["cost_usd"] for r in rows) / 3
+        usual = sum(r["cost_usd"] for r in rows) / WEEKS
         settings["budget_usd"] = limit = round(usual * 1.2)
 
-        lines, model, without = [], BIG, 0.0
+        lines, model, without, seen = [], BIG, 0.0, None
         for h in _working(monday, sunday):
             sim["now"] = h
             d = datetime.fromtimestamp(h)
             if d.hour in CHECK_HOURS:
+                if seen is None and o.outlook().state == "over":
+                    seen = (o.desktop_snapshot(), h)
                 new = o.llm_request(request={"model": BIG}, provider="demo", session_id="demo")
                 before, model = model, new["request"]["model"] if new else BIG
                 if d.hour == 12 or model != before:
@@ -77,4 +104,10 @@ def run(obol_cls, now: float) -> str:
             f"this one is {HEAVY:g}× as heavy.", f"  forecast: {name}"]
     tail = [f"  With no plugin: ${without:.2f}, ${without - limit:.2f} over the limit.",
             f"  With Obol in save mode: ${final:.2f}."]
-    return "\n".join(head + lines + tail)
+    chart = []
+    if seen:
+        if show:
+            show(_chip(seen[0]))
+        chart = [f"  What Obol saw on {datetime.fromtimestamp(seen[1]):%a %H:%M}, against the ${limit} limit:",
+                 *_bars(seen[0]["chart"])]
+    return "\n".join(head + chart + lines + tail)

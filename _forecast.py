@@ -34,6 +34,35 @@ def _quantile(xs, q):
     return xs[lo] + (xs[hi] - xs[lo]) * (pos - lo)
 
 
+def spread(hours, now, until):
+    """How much past stretches like this one varied, as (low, high) multiples of their average, or None with under 4.
+
+    Measured from the user's own history because the per-hour ranges can't be added into a range for a total."""
+    length = until - now
+    by_hour = dict(hours)
+    if length <= 0 or not by_hour:
+        return None
+    step = 86400 if length <= 86400 else 7 * 86400 if length <= 7 * 86400 else 30 * 86400
+    first, seen, k = min(by_hour), [], 1
+    while now - k * step >= first and len(seen) < 12:
+        start = int((now - k * step) // HOUR) * HOUR
+        seen.append(sum(by_hour.get(h, 0.0) or 0.0 for h in range(start, int(start + length), HOUR)))
+        k += 1
+    average = sum(seen) / len(seen) if seen else 0
+    if len(seen) < 4 or average <= 0:
+        return None
+    return min(_quantile(seen, 0.1) / average, 1.0), max(_quantile(seen, 0.9) / average, 1.0)
+
+
+def band(expected, ratios) -> dict:
+    """{"low", "high"} around an expected path that starts at now: the amount still to come, scaled by `spread`."""
+    if not ratios or not expected:
+        return {}
+    base = expected[0][1]
+    return {name: [[t, round(base + (v - base) * r, 4)] for t, v in expected]
+            for name, r in zip(("low", "high"), ratios)}
+
+
 # ── seasonal (always available) ──────────────────────────────────────────────
 
 def seasonal(hours, horizon):

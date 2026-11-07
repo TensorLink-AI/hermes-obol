@@ -19,6 +19,8 @@ from . import _backfill, _budget, _forecast, _limits, _rules
 from ._pricing import Prices
 from ._store import HOUR, Store
 
+DEMO_FOR = 300                  # how long /obol demo's chart stays on the chip
+
 log = logging.getLogger("hermes_plugins.obol")
 
 SECRET = "EPHEMERIS_API_KEY"
@@ -175,11 +177,37 @@ class Obol:
                 continue
             total += max(0.0, v - self.store.spent(current, now, b.provider)) if h == current else v
             expected.append([min(h + HOUR, o.end), round(total, 4)])
-        return {"start": o.start, "end": o.end, "limit": o.usd, "actual": actual[-200:], "expected": expected[:200]}
+        expected = expected[:200]
+        past = self.store.hourly(until=now, provider=b.provider)
+        return {"title": self.label(b), "unit": "$", "start": o.start, "end": o.end, "limit": o.usd,
+                "actual": actual[-200:], "expected": expected, "out_at": o.out_median,
+                **_forecast.band(expected, _forecast.spread(past, now, o.end))}
+
+    def _window_chart(self, w: dict) -> dict | None:
+        """A plan window in percent: the readings so far, then where it's heading."""
+        size, reset = _limits.length(w["label"]), w.get("reset_at")
+        if not size or not reset:
+            return None
+        now = self.clock()
+        log = ((self.store.meta(f"limits:{w['provider']}") or {}).get("log") or {}).get(w["label"]) or {}
+        actual = [[reset - size, 0.0]] + (log.get("points") or [])[-200:] + [[now, w["used"]]]
+        chart = {"title": w["name"], "unit": "%", "start": reset - size, "end": reset, "limit": 100.0, "actual": actual,
+                 "expected": w.get("path") or [], "out_at": w.get("out_at")}
+        if w.get("how") == "forecast":
+            past = self.store.hourly_tokens(until=now, provider=w["provider"])
+            chart.update(_forecast.band(chart["expected"], _forecast.spread(past, now, reset)))
+        return chart
+
+    def show_demo(self, snapshot: dict) -> None:
+        """Put /obol demo's made-up chart on the chip for a few minutes. It's labelled, and it can't raise an alert."""
+        self.store.set_meta("demo_chip", {"until": self.clock() + DEMO_FOR, "snapshot": snapshot})
 
     def desktop_snapshot(self) -> dict:
         """What the Desktop chip shows: the budget or plan window closest to running out."""
         now, when, money = self.clock(), _budget._when, _budget._money
+        demo = self.store.meta("demo_chip")
+        if demo and demo["until"] > now:
+            return dict(demo["snapshot"], at=now)
         rows = []
         for b in self.budgets():
             o = self.outlook(b)
@@ -188,9 +216,10 @@ class Obol:
                 rows.append({"state": o.state if o.state != "unknown" else "ok", "out": o.out_median, "budget": b,
                              "chip": text, "line": f"{self.label(b)}: {_budget.line(o, now)}", "model": o.model})
         for p in _limits.PROVIDERS:
-            for w in self.limit_windows(p):
-                rows.append({"state": w["state"], "out": w["out_at"], "budget": None, "line": w["line"],
-                             "chip": f"{w['name']} {w['used']:.0f}%", "model": ""})
+            for w in self.limit_windows(p, with_path=True):
+                how = {"forecast": "your token forecast", "pace": "your pace so far"}.get(w["how"], "")
+                rows.append({"state": w["state"], "out": w["out_at"], "budget": None, "line": w["line"], "window": w,
+                             "chip": f"{w['name']} {w['used']:.0f}%", "model": how})
         rows.sort(key=lambda r: (_rules.SEVERITY.get(r["state"], 0), -(r["out"] or float("inf"))), reverse=True)
         if not rows:
             u = self.unbudgeted()
@@ -202,10 +231,9 @@ class Obol:
             chip += " · used up"
         elif top["out"] and top["state"] == "over":
             chip += f" · out {when(top['out'], now)}"
-        with_budget = next((r for r in rows if r["budget"]), None)
         return {"state": top["state"], "chip": chip, "at": now, "lines": [r["line"] for r in rows[:4]],
-                "forecast": (with_budget or {}).get("model") or "",
-                "chart": self._chart(with_budget["budget"]) if with_budget else None}
+                "forecast": top["model"] or "",
+                "chart": self._chart(top["budget"]) if top["budget"] else self._window_chart(top["window"])}
 
     def write_desktop(self, every: float = 0) -> None:
         """Leave the chip's data where the Desktop backend can serve it, without opening the ledger itself."""
@@ -229,8 +257,14 @@ class Obol:
         now = self.clock()
         got = _limits.read(provider)
         old = self.store.meta(f"limits:{provider}") or {}
-        rec = {"read_at": now, "tried_at": now, "windows": got["windows"], "error": None} if not got["error"] else \
-              {"read_at": old.get("read_at"), "tried_at": now, "windows": old.get("windows") or [], "error": got["error"]}
+        # Readings saved before `settle` existed may hold a false 100, so they can't vouch for a new one.
+        trusted = old.get("windows") or [] if old.get("settled") else []
+        windows = _limits.settle(provider, got["windows"], trusted)
+        log = old.get("log") or {}
+        rec = {"read_at": now, "tried_at": now, "windows": windows, "error": None, "settled": True,
+               "log": _limits.remember(log, windows, now)} if not got["error"] else \
+              {"read_at": old.get("read_at"), "tried_at": now, "windows": trusted, "error": got["error"], "settled": True,
+               "log": log}
         self.store.set_meta(f"limits:{provider}", rec)
         return rec
 
@@ -275,13 +309,13 @@ class Obol:
         self.store.set_meta(key, rec)
         return rec
 
-    def limit_windows(self, provider: str, fresh_only: bool = False) -> list:
+    def limit_windows(self, provider: str, fresh_only: bool = False, with_path: bool = False) -> list:
         """Each plan window with its projection, worst first."""
         if not self._limits_on():
             return []
         rec = self.store.meta(f"limits:{provider}") or {}
         now = self.clock()
-        if not rec.get("windows") or (fresh_only and now - (rec.get("read_at") or 0) > LIMITS_STALE):
+        if not rec.get("settled") or not rec.get("windows") or (fresh_only and now - (rec.get("read_at") or 0) > LIMITS_STALE):
             return []
         name = _limits.NAMES.get(provider, provider)
         path = None
@@ -297,6 +331,9 @@ class Obol:
             hour = self.store.tokens(int(now // HOUR) * HOUR, now, provider)
             p = _limits.project(used, now, reset, size, tokens_in, (path or {}).get("mean"), (path or {}).get("start"), hour)
             st = _limits.state(used, p["expected"])
+            line = p.pop("path")
+            if with_path:
+                p["path"] = line
             rows.append(dict(w, provider=provider, name=f"{name} {w['label'].lower()}", state=st, **p,
                              line=self._window_line(name, w["label"], used, reset, p, st, now)))
         return _limits.worst_first(rows)
