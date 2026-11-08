@@ -24,12 +24,15 @@ console.log('server render (effects do not run):', JSON.stringify(renderToString
 // Details and Chart aren't exported: exercise them through a copy that exports them.
 writeFileSync('plugin_parts.mjs', readFileSync('plugin_under_test.mjs', 'utf8') + '\nexport { Details, Chip }\n')
 const parts = await import(pathToFileURL(resolve('plugin_parts.mjs')))
-const data = { state: 'over', chip: '$6.20/$20 · out Fri 14:00', forecast: 'Cascade', lines: ['$6.20 of $20 · ⚠ on track to run out ~Fri 14:00'],
+const data = { state: 'over', at: Date.now() / 1000, rows: [{ title: 'Claude week', state: 'over', used: 40, expected: 130, start: Date.now() / 1000 - 3600, end: Date.now() / 1000 + 3600, out_at: Date.now() / 1000 + 1800 }], chip: '$6.20/$20 · out Fri 14:00', forecast: 'Cascade', lines: ['$6.20 of $20 · ⚠ on track to run out ~Fri 14:00'],
   chart: { title: 'This week', unit: '$', start: 0, end: 100, limit: 20, out_at: 85, actual: [[0, 0], [40, 6.2]],
            expected: [[40, 6.2], [90, 22]], low: [[40, 6.2], [90, 18]], high: [[40, 6.2], [90, 26]] } }
 const html = renderToString(jsx(parts.Details, { data }))
-for (const want of ['<svg', '<polygon', 'out ', 'resets ', 'Shaded', 'on track to run out', 'stroke-dasharray', 'Type /obol']) if (!html.includes(want)) throw new Error('missing ' + want)
-renderToString(jsx(parts.Details, { data: { state: 'none', chip: 'Obol', lines: ['x'] } }))
+for (const want of ['<svg', '<polygon', 'out ', 'resets ', 'Shaded', 'Runs out', 'before it resets', 'Resets ', 'Hatched', 'Updated', '40% used', 'stroke-dasharray', 'Forecast: Cascade']) if (!html.includes(want)) throw new Error('missing ' + want)
+const demo = renderToString(jsx(parts.Details, { data: { state: 'demo', lines: ['x'], rows: [{ title: 'Week', state: 'over', used: 10, expected: 150, start: 1000, end: 2000, now: 1100, out_at: 1800 }] } }))
+if (!demo.includes('10% of the time')) throw new Error('demo bar ignored its clock')
+const empty = renderToString(jsx(parts.Details, { data: { state: 'none', chip: 'Obol', lines: ['x'] } }))
+if (!empty.includes('Type /obol') || !empty.includes('>x<')) throw new Error('bad empty panel')
 const plan = renderToString(jsx(parts.Details, { data: { state: 'out', chip: 'x', lines: ['x'], chart: { title: 'w', unit: '%', start: 0, end: 100,
   limit: 100, actual: [[0, 0], [50, 100]], expected: [], out_at: null } } }))
 if (!plan.includes('100%') || plan.includes('<polygon')) throw new Error('bad plan chart')

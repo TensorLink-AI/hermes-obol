@@ -20,6 +20,8 @@ from ._pricing import Prices
 from ._store import HOUR, Store
 
 DEMO_FOR = 300                  # how long /obol demo's chart stays on the chip
+CHIP_EVERY = 30                 # rewrite the chip this often, so it stays right with no requests arriving
+CHIP_FIRST = 5                  # wait this long after loading: short-lived Hermes commands load plugins too
 
 log = logging.getLogger("hermes_plugins.obol")
 
@@ -49,6 +51,7 @@ class Obol:
         self._lock = threading.Lock()
         self._refreshing = False
         self._reading = set()
+        self._saved_only = threading.local()
 
     # opened on first use, not in register(): the plugin probe has no profile data directory
     @property
@@ -145,7 +148,11 @@ class Obol:
             log.warning("obol: couldn't price %s", model, exc_info=True)
             cost, status = None, "unpriced"
         if self.prices.stale(self.clock()):
-            self.prices.refresh_async(on_done=lambda: self.store.reprice(self.prices.cost))
+            def repriced():
+                self.store.reprice(self.prices.cost)
+                self.redraw_desktop()
+
+            self.prices.refresh_async(on_done=repriced)
         self.store.add_call(
             session_id=kw.get("session_id") or "", platform=kw.get("platform") or "",
             provider=provider, model=model, aux_task=kw.get("aux_task") or "",
@@ -214,12 +221,19 @@ class Obol:
             if o:
                 text = f"{money(o.spent)}/{money(o.usd)}"
                 rows.append({"state": o.state if o.state != "unknown" else "ok", "out": o.out_median, "budget": b,
-                             "chip": text, "line": f"{self.label(b)}: {_budget.line(o, now)}", "model": o.model})
+                             "chip": text, "line": f"{self.label(b)}: {_budget.line(o, now)}", "model": o.model,
+                             "meter": {"title": self.label(b)[:1].upper() + self.label(b)[1:], "amount": text, "used": 100 * o.spent / o.usd,
+                                       "expected": None if o.end_median is None else 100 * o.end_median / o.usd,
+                                       "start": o.start, "end": o.end, "out_at": o.out_median}})
         for p in _limits.PROVIDERS:
             for w in self.limit_windows(p, with_path=True):
-                how = {"forecast": "your token forecast", "pace": "your pace so far"}.get(w["how"], "")
+                how = {"forecast": "your token history", "pace": "your pace so far"}.get(w["how"], "")
+                size = _limits.length(w["label"])
+                meter = None if not size or not w.get("reset_at") else {
+                    "title": w["name"], "used": w["used"], "expected": w["expected"], "start": w["reset_at"] - size,
+                    "end": w["reset_at"], "out_at": w["out_at"]}
                 rows.append({"state": w["state"], "out": w["out_at"], "budget": None, "line": w["line"], "window": w,
-                             "chip": f"{w['name']} {w['used']:.0f}%", "model": how})
+                             "chip": f"{w['name']} {w['used']:.0f}%", "model": how, "meter": meter})
         rows.sort(key=lambda r: (_rules.SEVERITY.get(r["state"], 0), -(r["out"] or float("inf"))), reverse=True)
         if not rows:
             u = self.unbudgeted()
@@ -232,6 +246,7 @@ class Obol:
         elif top["out"] and top["state"] == "over":
             chip += f" · out {when(top['out'], now)}"
         return {"state": top["state"], "chip": chip, "at": now, "lines": [r["line"] for r in rows[:4]],
+                "rows": [dict(r["meter"], state=r["state"]) for r in rows[:4] if r["meter"]],
                 "forecast": top["model"] or "",
                 "chart": self._chart(top["budget"]) if top["budget"] else self._window_chart(top["window"])}
 
@@ -241,13 +256,42 @@ class Obol:
         if every and now - getattr(self, "_desktop_at", 0) < every:
             return
         self._desktop_at = now
+        self._write_desktop()
+
+    def _write_desktop(self, keep_at: bool = False) -> None:
         try:
             path = self.data_dir / "desktop.json"
+            snapshot = self.desktop_snapshot()
+            if keep_at and path.exists():    # "Updated" on the panel means new data arrived, not that a timer fired
+                snapshot["at"] = json.loads(path.read_text()).get("at") or snapshot["at"]
             tmp = path.with_suffix(f".{threading.get_ident()}.tmp")
-            tmp.write_text(json.dumps(self.desktop_snapshot(), default=str))
+            tmp.write_text(json.dumps(snapshot, default=str))
             tmp.replace(path)
         except Exception:
             log.warning("obol: couldn't write the Desktop snapshot", exc_info=True)
+
+    def redraw_desktop(self) -> None:
+        """Rewrite the chip from saved data, for threads with no request behind them. Runs no forecast, paid or local."""
+        self._saved_only.on = True
+        try:
+            self._write_desktop(keep_at=True)
+        finally:
+            self._saved_only.on = False
+
+    def keep_chip_current(self, first: float = CHIP_FIRST, every: float = CHIP_EVERY) -> None:
+        """Windows reset and demos end while nothing is running, and a restart should correct the chip by itself."""
+        def run():
+            time.sleep(first)
+            while True:
+                try:
+                    if (self.data_dir / "obol.db").exists():   # never used on this profile: nothing to show
+                        self.redraw_desktop()
+                except Exception:
+                    log.debug("obol: couldn't refresh the chip", exc_info=True)
+                time.sleep(every)
+
+        # Same context as register(), so a background tick resolves the same profile directory.
+        threading.Thread(target=contextvars.copy_context().run, args=(run,), name="obol-chip", daemon=True).start()
 
     def _limits_on(self) -> bool:
         return str(self._get("plan_limits", "on") or "on") != "off"
@@ -266,6 +310,7 @@ class Obol:
               {"read_at": old.get("read_at"), "tried_at": now, "windows": trusted, "error": got["error"], "settled": True,
                "log": log}
         self.store.set_meta(f"limits:{provider}", rec)
+        self.write_desktop()   # the request that asked for this reading already wrote the chip with the old one
         return rec
 
     def read_limits_later(self, provider: str) -> None:
@@ -358,6 +403,8 @@ class Obol:
         b = b or self.budget()
         key = f"forecast:{b.provider or '*'}:{b.period}"
         cached = self.store.meta(key)
+        if getattr(self._saved_only, "on", False):
+            return cached
         now = self.clock()
         hours = self.store.hourly(until=now, provider=b.provider)
         if not hours:
@@ -432,6 +479,7 @@ class Obol:
             finally:
                 with self._lock:
                     self._refreshing = False
+            self.redraw_desktop()
 
         threading.Thread(target=run, name="obol-forecast", daemon=True).start()
 
@@ -889,6 +937,7 @@ def _safe(fn):
 def register(ctx):
     global _obol
     _obol = Obol(ctx)
+    _obol.keep_chip_current()
     from . import _commands
     for hook in ("post_api_request", "post_auxiliary_call"):
         ctx.register_hook(hook, _safe(_obol.meter))

@@ -811,6 +811,87 @@ def test_snapshot_is_written_for_the_backend_and_throttled(make, tmp_path):
     assert json.loads((o._data_dir / "desktop.json").read_text())["state"]
 
 
+def test_a_new_limit_reading_reaches_the_chip_without_waiting_for_another_request(make, tmp_path, monkeypatch):
+    import json
+    o = make({})
+    _plan(o, monkeypatch, used=0.0, label="Current week", reset_in=3 * 86400)
+    o.clock_obj.t += 600
+    _plan(o, monkeypatch, used=4.0, label="Current week", reset_in=3 * 86400 - 600)
+    assert json.loads((tmp_path / "desktop.json").read_text())["chip"] == "Claude current week 4%"
+
+
+def _chip(tmp_path):
+    import json
+    return json.loads((tmp_path / "desktop.json").read_text())
+
+
+def test_a_window_that_resets_while_idle_leaves_the_chip(make, tmp_path, monkeypatch):
+    o = make({})
+    _plan(o, monkeypatch, used=100.0, label="Current week", reset_in=HOUR, provider="openai-codex")
+    o.write_desktop()
+    assert _chip(tmp_path)["state"] == "out"
+    o.clock_obj.t += HOUR + 1
+    o.redraw_desktop()
+    assert _chip(tmp_path)["state"] != "out" and "used up" not in _chip(tmp_path)["chip"]
+
+
+def test_a_demo_leaves_the_chip_while_idle(make, tmp_path):
+    o = make({"budget_usd": 50})
+    _commands.run(o, "demo")
+    o.write_desktop()
+    assert _chip(tmp_path)["state"] == "demo"
+    o.clock_obj.t += 301
+    o.redraw_desktop()
+    assert _chip(tmp_path)["state"] != "demo"
+
+
+def test_a_timer_redraw_does_not_claim_new_data(make, tmp_path):
+    o = make({"budget_usd": 30})
+    feed(o, 5, 0.5)
+    o.write_desktop()
+    at = _chip(tmp_path)["at"]
+    o.clock_obj.t += 600
+    o.redraw_desktop()
+    assert _chip(tmp_path)["at"] == at
+
+
+def test_a_redraw_runs_no_forecast(make, tmp_path, monkeypatch):
+    o = make({"budget_usd": 30})
+    feed(o, 5, 0.5)
+    o.write_desktop()
+    calls = []          # recorded, not raised: write_desktop swallows errors so a chip can't break a request
+    monkeypatch.setattr(_forecast, "choose", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(o, "_refresh_async", lambda *a, **k: calls.append(a))
+    o.clock_obj.t += 3 * HOUR
+    o.redraw_desktop()
+    assert calls == [] and _chip(tmp_path)["chip"].startswith("$")
+
+
+def test_the_chip_timer_writes_once_the_profile_has_data(make, tmp_path):
+    import threading, time
+    o = make({"budget_usd": 30})
+    feed(o, 5, 0.5)
+    assert not (tmp_path / "desktop.json").exists()
+    o.keep_chip_current(first=0, every=3600)
+    deadline = time.time() + 5
+    while not (tmp_path / "desktop.json").exists() and time.time() < deadline:
+        time.sleep(0.01)
+    assert _chip(tmp_path)["chip"].startswith("$")
+    assert any(t.name == "obol-chip" and t.daemon for t in threading.enumerate())
+
+
+def test_a_finished_model_forecast_reaches_the_chip(make, tmp_path, monkeypatch):
+    import threading
+    o = make({"budget_usd": 30})
+    feed(o, 5, 0.5)
+    monkeypatch.setattr(_forecast, "ephemeris", lambda *a, **k: _forecast.seasonal(o.store.hourly(until=o.clock()), 24))
+    o._refresh_async("forecast:*:week", "ephemeris", o.store.hourly(until=o.clock()), 24, 0)
+    for t in threading.enumerate():
+        if t.name == "obol-forecast":
+            t.join(5)
+    assert (tmp_path / "desktop.json").exists()
+
+
 def test_a_sudden_claude_100_is_read_as_1_until_the_window_has_climbed():
     from obol import _limits
     w = {"label": "Current session", "used": 100.0, "scope": "account", "reset_at": 5000.0}
@@ -872,3 +953,15 @@ def test_demo_draws_the_week_and_labels_the_chip(make):
     assert s["chart"]["expected"][-1][1] > s["chart"]["limit"] and s["chart"]["high"]
     o.store.set_meta("demo_chip", {"until": o.clock() - 1, "snapshot": s})
     assert o.desktop_snapshot()["state"] != "demo"
+
+
+def test_snapshot_gives_the_panel_a_meter_for_each_limit(make, monkeypatch):
+    o = make({"budget_usd": 30, "period": "week"})
+    feed(o, 40, 0.5)
+    _plan(o, monkeypatch, used=30, reset_in=2 * HOUR)
+    rows = o.desktop_snapshot()["rows"]
+    assert {r["title"] for r in rows} >= {"Claude current session"} and len(rows) == 2
+    plan = next(r for r in rows if r["title"] == "Claude current session")
+    assert plan["used"] == 30 and plan["end"] - plan["start"] == 5 * HOUR and plan["state"] == "ok"
+    budget = next(r for r in rows if r["title"] != "Claude current session")
+    assert budget["amount"].startswith("$") and budget["used"] > 0

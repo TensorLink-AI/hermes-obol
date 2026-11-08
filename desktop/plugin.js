@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const POLL_MS = 15_000
+const STALE_S = 15 * 60
 const HOT = { over: 'var(--ui-accent)', out: 'var(--ui-accent)', demo: 'var(--ui-accent)' }
 const WARN = ['over', 'out']
 const UNAVAILABLE = {
@@ -38,8 +39,7 @@ function Chart({ chart }) {
 
   return jsxs('svg', {
     viewBox: `0 0 ${W} ${H}`,
-    width: W,
-    height: H,
+    style: { display: 'block', width: '100%', height: 'auto' },
     role: 'img',
     'aria-label': `${chart.title || 'Usage'}: so far and where it is heading, against the limit`,
     children: [
@@ -62,33 +62,149 @@ function Chart({ chart }) {
   })
 }
 
+function length(seconds) {
+  const left = Math.max(0, seconds)
+  const days = Math.floor(left / 86400)
+  const hours = Math.floor((left % 86400) / 3600)
+  const minutes = Math.floor((left % 3600) / 60)
+  return days ? `${days}d ${hours}h` : hours ? `${hours}h ${minutes}m` : `${minutes}m`
+}
+
+const share = (t, row) => Math.max(0, Math.min(100, ((t - row.start) / (row.end - row.start)) * 100))
+const nowS = () => Date.now() / 1000
+
+// A runway, not a usage bar: the track is the time until the reset. Filled has passed; hatched is time with nothing left to spend.
+function Runway({ row, height = 8 }) {
+  const passed = share(row.now ?? nowS(), row)   // the demo's week runs on its own clock
+  const dryFrom = row.state === 'out' ? passed : row.out_at ? Math.max(passed, share(row.out_at, row)) : null
+  const fill = HOT[row.state] || 'var(--ui-text-secondary)'
+  const bar = (left, width, extra) => ({ position: 'absolute', top: 0, bottom: 0, left: `${left}%`, width: `${width}%`, ...extra })
+  return jsxs('div', {
+    role: 'img',
+    'aria-label': `${Math.round(passed)}% of the time until the reset has passed${dryFrom === null ? '' : `, and you run out at ${Math.round(dryFrom)}%`}`,
+    style: { position: 'relative', height, borderRadius: 2, background: 'var(--ui-stroke-secondary)', overflow: 'hidden' },
+    children: [
+      jsx('div', { style: bar(0, passed, { background: fill }) }),
+      dryFrom === null
+        ? null
+        : jsx('div', {
+            style: bar(dryFrom, 100 - dryFrom, {
+              background: 'repeating-linear-gradient(135deg, var(--ui-accent) 0 2px, transparent 2px 4px)'
+            })
+          })
+    ]
+  })
+}
+
+// The answer the panel exists to give, for the limit closest to running out.
+function verdict(row) {
+  const left = row.end - (row.now ?? nowS())
+  if (row.state === 'out') return { head: 'Used up', sub: `${row.title} is back in ${length(left)}` }
+  if (row.out_at) {
+    return {
+      head: `Runs out ${when(row.out_at, row.end - row.start)}`,
+      sub: `${row.title}: ${length(row.end - row.out_at)} before it resets`
+    }
+  }
+  if (row.expected == null) return { head: 'No forecast yet', sub: `${row.title}: ${Math.round(row.used)}% used` }
+  return {
+    head: row.state === 'tight' ? 'Close to the limit' : 'Enough until the reset',
+    sub: `${row.title}: finishing near ${Math.round(row.expected)}%`
+  }
+}
+
+function note(row) {
+  const span = row.end - row.start
+  if (row.state === 'out') return 'Used up'
+  if (row.out_at) return `Out ${when(row.out_at, span)}`
+  return row.expected == null ? '' : `Near ${Math.round(row.expected)}% at reset`
+}
+
+function Row({ row, headline }) {
+  const hot = HOT[row.state]
+  const accent = hot ? { color: hot } : undefined
+  return jsxs('div', {
+    className: 'flex flex-col gap-1',
+    children: [
+      jsxs('div', {
+        className: 'flex items-baseline justify-between gap-2',
+        children: [
+          jsx('span', { children: row.title }),
+          jsx('span', { style: { fontVariantNumeric: 'tabular-nums' }, children: row.amount || `${Math.round(row.used)}% used` })
+        ]
+      }),
+      jsx(Runway, { row }),
+      jsxs('div', {
+        className: 'flex items-baseline justify-between gap-2 text-(--ui-text-tertiary)',
+        children: [
+          jsx('span', { style: accent, children: headline ? '' : note(row) }),
+          jsx('span', { children: `Resets ${when(row.end, row.end - row.start)}` })
+        ]
+      })
+    ]
+  })
+}
+
 function Details({ data }) {
+  const rows = data.rows || []
+  const stale = data.at && nowS() - data.at > STALE_S
+  const top = rows[0] ? verdict(rows[0]) : null
   return jsxs('div', {
     style: {
       position: 'fixed',
       right: 12,
       bottom: 32,
       zIndex: 50,
-      width: 304,
+      width: 320,
+      boxSizing: 'border-box',
       padding: 12,
-      borderRadius: 8,
+      borderRadius: 6,
       background: 'var(--ui-bg-elevated, var(--background))',
       border: '1px solid var(--ui-stroke-secondary)'
     },
-    className: 'flex flex-col gap-2 text-xs',
+    className: 'flex flex-col gap-3 text-xs',
     children: [
-      jsx('div', { className: 'font-medium', children: 'Obol' }),
-      data.chart ? jsx('div', { className: 'text-(--ui-text-secondary)', children: data.chart.title }) : null,
-      data.chart ? jsx(Chart, { chart: data.chart }) : null,
-      data.chart
+      top
+        ? jsxs('div', {
+            className: 'flex flex-col gap-1',
+            children: [
+              jsx('div', { className: 'font-medium', style: { fontSize: 15, color: HOT[rows[0].state] }, children: top.head }),
+              jsx('div', { className: 'text-(--ui-text-secondary)', children: top.sub })
+            ]
+          })
+        : jsx('div', { className: 'font-medium', children: 'Obol' }),
+      ...rows.map((row, i) => jsx(Row, { row, headline: i === 0 }, i)),
+      rows.length
         ? jsx('div', {
             className: 'text-(--ui-text-tertiary)',
-            children: `Solid: so far. Dashed: forecast.${data.chart.high ? ' Shaded: how much your past periods varied.' : ''}`
+            children: `Bars show the time until each reset.${rows.some(r => r.out_at || r.state === 'out') ? ' Hatched: out of tokens.' : ''}`
           })
         : null,
-      ...(data.lines || []).map((line, i) => jsx('div', { className: 'text-(--ui-text-secondary)', children: line }, i)),
-      data.forecast ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `forecast: ${data.forecast}` }) : null,
-      jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'Type /obol for more' })
+      data.chart
+        ? jsxs('div', {
+            className: 'flex flex-col gap-1',
+            children: [
+              rows.length === 1 ? null : jsx('div', { className: 'text-(--ui-text-secondary)', children: data.chart.title }),
+              jsx(Chart, { chart: data.chart }),
+              jsx('div', {
+                className: 'text-(--ui-text-tertiary)',
+                children: `Solid: so far. Dashed: forecast.${data.chart.high ? ' Shaded: how much your past periods varied.' : ''}`
+              })
+            ]
+          })
+        : null,
+      ...(rows.length ? (data.demo ? data.lines.slice(0, 1) : []) : data.lines || []).map((line, i) =>
+        jsx('div', { className: 'text-(--ui-text-secondary)', children: line }, `line${i}`)
+      ),
+      jsxs('div', {
+        className: 'flex items-baseline justify-between gap-2 text-(--ui-text-tertiary)',
+        children: [
+          jsx('span', { children: data.forecast ? `Forecast: ${data.forecast}` : 'Type /obol for more' }),
+          data.at
+            ? jsx('span', { style: { whiteSpace: 'nowrap' }, children: `${stale ? '≈ ' : ''}Updated ${when(data.at, 0)}` })
+            : null
+        ]
+      })
     ]
   })
 }
@@ -125,16 +241,23 @@ function Chip({ ctx }) {
 
   if (!data) return null
 
+  const top = data.rows?.[0]
+  const hot = HOT[data.state]
   return jsxs('span', {
     children: [
-      jsx('button', {
+      jsxs('button', {
         type: 'button',
         title: data.lines?.[0],
-        className: 'px-1.5 text-[0.6875rem] text-(--ui-text-tertiary)',
-        style: HOT[data.state] ? { color: HOT[data.state] } : undefined,
+        'aria-expanded': open,
+        className: 'inline-flex items-center gap-1.5 px-1.5 text-[0.6875rem] text-(--ui-text-tertiary)',
+        style: hot ? { color: hot } : undefined,
         onClick: () => setOpen(!open),
-        children: data.chip
+        children: [
+          top ? jsx('span', { style: { display: 'block', width: 28 }, children: jsx(Runway, { row: top, height: 4 }) }) : null,
+          jsx('span', { children: data.chip })
+        ]
       }),
+      open ? jsx('div', { style: { position: 'fixed', inset: 0, zIndex: 49 }, onClick: () => setOpen(false) }) : null,
       open ? jsx(Details, { data }) : null
     ]
   })

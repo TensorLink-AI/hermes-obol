@@ -54,8 +54,9 @@ def _bars(chart: dict) -> list:
 
 
 def _chip(snapshot: dict) -> dict:
-    return dict(snapshot, state="demo", chip=f"Demo · {snapshot['chip']}", lines=[
-        "Made-up usage from /obol demo. Your real numbers come back in 5 minutes.", *snapshot["lines"][:1]])
+    return dict(snapshot, state="demo", demo=True, chip=f"Demo · {snapshot['chip']}", lines=[
+        "Made-up usage from /obol demo. Your real numbers come back in 5 minutes.", *snapshot["lines"][:1]],
+        rows=[dict(r, now=snapshot["at"]) for r in snapshot.get("rows", [])])   # bars follow the demo's clock, not today's
 
 
 def run(obol_cls, now: float, show=None) -> str:
