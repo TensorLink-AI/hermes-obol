@@ -24,6 +24,7 @@ import fnmatch
 import re
 
 STATES = ("ok", "tight", "over", "out")
+TASK_CAP = {"name": "task cap", "when": {"task_cap": True}, "do": {"block": True}}    # applies in every mode
 SEVERITY = {"ok": 0, "unknown": 0, "tight": 1, "over": 2, "out": 3}
 ACTIONS = ("note", "notify", "steer", "ask", "block")
 _CMP = re.compile(r"^\s*(>=|<=|>|<|==|=)?\s*\$?\s*([0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s*(x|%)?\s*$")
@@ -69,6 +70,9 @@ def matches(when: dict, ctx: dict) -> bool:
                 return False
         elif key in ("provider", "model", "platform"):
             if not _any(ctx.get(key), spec):
+                return False
+        elif key == "task_cap":
+            if bool(spec) != bool(ctx.get("task_cap_hit")):
                 return False
         elif key == "aux":
             if bool(spec) != bool(ctx.get("aux")):

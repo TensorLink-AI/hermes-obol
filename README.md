@@ -25,7 +25,8 @@ Restart Hermes (and its local gateway, `hermes gateway restart`), then in any se
 
 The forecast comes from a small model that runs on your CPU, offline. It learns from your Hermes history when you
 install it, so it works from day one, and it acts while there's still budget left. Budgets are in dollars, for API
-usage, and on Claude or Codex plans it forecasts the plan's own limits.
+usage. On Claude or Codex plans it forecasts the plan's own limits, and plan requests count as $0 against any budget.
+With under a day of history it says it's too early rather than guess.
 
 ```
 /obol
@@ -40,25 +41,25 @@ Obol · $6.20 of $20 · ⚠ on track to run out ~Fri 14:00
 | Mode | What Obol does |
 |---|---|
 | `alert` (default) | Tells you, under the agent's reply, and tells the agent, so it keeps answers short and asks before long work. |
-| `save` | Also switches to a cheaper model on the same provider, early, and tells you under the reply. |
+| `save` | Also switches to a cheaper model on the same provider, early, and tells you under the reply. Works on OpenRouter and similar routers, and on Anthropic, OpenAI, Codex, DeepSeek, Gemini and xAI when the model is theirs. On any other provider it never switches. |
 | `stop` | Also stops new turns, and tool calls inside a running turn, once the budget is used up. `/obol allow` sends one anyway. |
 
 `/obol demo` plays a made-up heavy week through the real forecast and rules, in a temporary ledger, so you can see
 what it does before you have any history. When a budget is short and a cheaper model is set, `/obol` also shows what
 switching would do, priced on your own recent token mix.
 
-Every setting is also on the plugin's page under Desktop → Settings → Plugins. The agent can check the budget itself
+Every setting is also on the plugin's page under Desktop → Capabilities → Plugins. The agent can check the budget itself
 with the `obol_budget` tool. After upgrading, restart Hermes and its gateway so the new code loads.
 
 ## Hermes Desktop
 
-A chip in the status bar shows whichever budget or plan limit is closest to running out, like `$6.20/$20 · out Fri 14:00`.
+A chip in the status bar shows whichever budget or plan limit is closest to running out, like `$6.20/$20 · out ~Fri 14:00`.
 Click it for the chart: use so far, the forecast, and when it crosses the limit, for a budget or a Claude or Codex window.
 The shaded range is how much your own past periods varied, and appears once there are four to measure. If a limit is about
 to go, it also shows a notification. `/obol demo` puts a made-up heavy week on the chip for 5 minutes, labelled as a demo.
 
 Installed from a terminal or by chat? Desktop keeps a plugin's Desktop half off until you choose. Turn it on under
-**Capabilities → Plugins → Obol → Desktop**. Installing from that page with "Enable after install" does this for you.
+**Capabilities → Plugins → Obol → Desktop**. Installing from that page with "Enable agent plugin after install" does this for you.
 
 ## Turning it off
 
@@ -79,8 +80,8 @@ Plan limits (the vendor's figures, across every client on the account):
 
 The percentages come from the vendor, so they include your use outside Hermes. The projection scales the token
 forecast by how much of the window each Hermes token has used so far, and falls back to your pace so far when most of
-the use came from somewhere else. It's a forecast, so treat the time as an early warning. Obol uses the sign-in
-Hermes holds, so a login that only exists in Claude Code or the Codex CLI isn't seen.
+the use came from somewhere else. It's a forecast, so treat the time as an early warning. Obol goes through whichever
+sign-in Hermes resolves, which can include a Claude Code login Hermes finds on the machine. Obol never touches it itself.
 
 ## Several APIs
 
@@ -134,7 +135,7 @@ The name: an obol was the small coin paid for the crossing that Hermes guided. A
 Obol uses the best forecaster this machine can run, and you never need an account:
 
 1. **Ephemeris** (optional): a hosted panel of larger time-series foundation models (Chronos-2, TimesFM 2.5,
-   Toto 2 and others). Used only after you save an Ephemeris API key, which is your opt-in. Ephemeris is a
+   Toto 2 and others). Used only when you save an Ephemeris API key and run `/obol forecaster ephemeris`. Ephemeris is a
    paid service run by TensorLink, the makers of Obol; new accounts get a small free credit. Without a key,
    `/obol` shows one line saying it exists. Nothing is ever added to the agent's context about it.
 2. **Cascade toktok 4M** (the default): [Cascade-toktok-4m-v1](https://huggingface.co/Tensor-Link/cascade-toktok-4m-v1),
@@ -174,12 +175,12 @@ as an early warning, not a promise. This is one user's data, and it may overlap 
 
 **Desktop.** The plugin writes a small `desktop.json` to its own data folder with the figures the chip shows. Its backend route, `/api/plugins/obol/status`, only reads that file, and the chip makes no other requests.
 
-**Plan limits.** While you use a Claude or Codex plan, at most every 5 minutes (and when you run `/obol limits`), Obol asks Hermes for that login's limits with `agent.account_usage.fetch_account_usage(read_only=True)`. Hermes makes the request to the vendor with the credential it already holds; Obol never sees the credential, and stores only the window names, percentages and reset times. Turn it off with the `plan_limits` setting.
+**Plan limits.** While you use a Claude or Codex plan, at most every 5 minutes, Obol asks Hermes for that login's limits with `agent.account_usage.fetch_account_usage(read_only=True)`. `/obol limits` and your first `/obol` ask about both providers. Hermes makes the request to the vendor with the credential it resolves, and for Claude it may refresh that login itself; Obol never sees the credential, and stores only the window names, percentages and reset times. Turn it off with the `plan_limits` setting.
 
 - **What it reads:** the token counts and model of each provider request, from Hermes's
   `post_api_request` and `post_auxiliary_call` hooks. It never reads prompt or reply text. Cost comes from
-  Hermes's own price list (`agent.usage_pricing`). Requests Hermes can't price count as $0 and are reported
-  in `/obol`.
+  your `prices` setting, OpenRouter's public price list, or a few built-in prices. Requests with no price count
+  as $0 and are reported in `/obol`. Plan requests, `:free` models and local endpoints cost $0.
 - **Past usage (once):** on first use, Obol reads the active profile's `state.db` read-only to learn how
   you have used Hermes: each session's time span, model, billing provider, token counts and cost, plus the
   timestamps of its assistant replies. It never reads message text. Only time before Obol's own first
@@ -191,17 +192,19 @@ as an early warning, not a promise. This is one user's data, and it may overlap 
   calls once the budget is used up. In `save` mode, the `llm_request` middleware replaces only the `model`
   field of the request with your `cheap_model` (main-loop requests; auxiliary calls such as titles and
   compression are metered but not steered). If the provider refuses the cheap model, steering to it pauses
-  for 6 hours. `alert` mode only adds context and a line under replies. Nothing is auto-approved,
-  and no Hermes code is patched.
-- **Network:** none by default.
-  - With an Ephemeris key saved, at most one forecast per hour (only after a new hour of data) goes to
+  for 6 hours. `alert` mode only adds context and a line under replies. A `/obol cap` stops turns and tool calls in every
+  mode. Obol never approves anything itself, and no Hermes code is patched.
+- **Network:** these requests, and no others:
+  - Plan limits, through Hermes, as described above. Turn them off with the `plan_limits` setting.
+  - With an Ephemeris key saved and `forecaster: ephemeris` chosen, at most one forecast per budget per hour goes to
     `https://ephemeris.cascade.industries/api/v1/forecast`. It carries only the hourly dollar totals, with
     no prompts, model names, sessions or identifiers, and it spends Ephemeris credits. No automatic retries;
     after a failure Obol stays local for 3 hours.
   - Prices: at most once a day, a GET of OpenRouter's public model list (`openrouter.ai/api/v1/models`),
     with no key and nothing about you sent.
-- **Background work:** model forecasts run in a short-lived background thread, never inside a hook. No
-  subprocesses, no telemetry.
+- **Background work:** the local Cascade forecast takes about 20 ms and runs inside a hook, Ephemeris forecasts run in
+  a short-lived background thread, and a background timer rewrites `desktop.json` every 30 seconds from saved data.
+  No subprocesses, no telemetry.
 - **Credentials:** the optional Ephemeris key is a `secret` setting, read with
   `agent.secret_scope.get_secret`. Obol never reads `.env`, `auth.json` or any other tool's credentials.
 

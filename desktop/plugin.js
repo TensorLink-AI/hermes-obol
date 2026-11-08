@@ -54,7 +54,7 @@ function Chart({ chart }) {
       jsx('path', { d: path(chart.actual), fill: 'none', stroke: 'var(--ui-text-secondary)', strokeWidth: 1.5 }),
       out !== null ? jsx('circle', { cx: out, cy: y(chart.limit), r: 3, fill: 'var(--ui-accent)' }) : null,
       out !== null
-        ? label(`out ${when(chart.out_at, span)}`, out, y(chart.limit) - 6, out > W / 2 ? 'end' : 'start', 'var(--ui-accent)')
+        ? label(`out ~${around(chart.out_at, span)}`, out, y(chart.limit) - 6, out > W / 2 ? 'end' : 'start', 'var(--ui-accent)')
         : null,
       label(when(chart.start, span), 0, H - 2, 'start'),
       label(`resets ${when(chart.end, span)}`, W, H - 2, 'end')
@@ -68,6 +68,12 @@ function length(seconds) {
   const hours = Math.floor((left % 86400) / 3600)
   const minutes = Math.floor((left % 3600) / 60)
   return days ? `${days}d ${hours}h` : hours ? `${hours}h ${minutes}m` : `${minutes}m`
+}
+
+// Forecasts are rough: never quote one to the minute.
+const around = (t, span) => {
+  const step = span > 86400 ? 3600 : 900
+  return when(Math.round(t / step) * step, span)
 }
 
 const share = (t, row) => Math.max(0, Math.min(100, ((t - row.start) / (row.end - row.start)) * 100))
@@ -102,13 +108,13 @@ function verdict(row) {
   if (row.state === 'out') return { head: 'Used up', sub: `${row.title} is back in ${length(left)}` }
   if (row.out_at) {
     return {
-      head: `Runs out ${when(row.out_at, row.end - row.start)}`,
-      sub: `${row.title}: ${length(row.end - row.out_at)} before it resets`
+      head: `Likely out around ${around(row.out_at, row.end - row.start)}`,
+      sub: `${row.title}: about ${length(row.end - row.out_at)} before it resets`
     }
   }
   if (row.expected == null) return { head: 'No forecast yet', sub: `${row.title}: ${Math.round(row.used)}% used` }
   return {
-    head: row.state === 'tight' ? 'Close to the limit' : 'Enough until the reset',
+    head: row.state === 'tight' ? 'Close to the limit' : 'Should last until the reset',
     sub: `${row.title}: finishing near ${Math.round(row.expected)}%`
   }
 }
@@ -116,7 +122,7 @@ function verdict(row) {
 function note(row) {
   const span = row.end - row.start
   if (row.state === 'out') return 'Used up'
-  if (row.out_at) return `Out ${when(row.out_at, span)}`
+  if (row.out_at) return `Likely out ~${around(row.out_at, span)}`
   return row.expected == null ? '' : `Near ${Math.round(row.expected)}% at reset`
 }
 
@@ -199,7 +205,7 @@ function Details({ data }) {
       jsxs('div', {
         className: 'flex items-baseline justify-between gap-2 text-(--ui-text-tertiary)',
         children: [
-          jsx('span', { children: data.forecast ? `Forecast: ${data.forecast}` : 'Type /obol for more' }),
+          jsx('span', { children: data.forecast ? `An estimate from ${data.forecast}` : 'Type /obol for more' }),
           data.at
             ? jsx('span', { style: { whiteSpace: 'nowrap' }, children: `${stale ? '≈ ' : ''}Updated ${when(data.at, 0)}` })
             : null

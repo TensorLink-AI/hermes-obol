@@ -100,9 +100,8 @@ def run(obol_cls, now: float, show=None) -> str:
                              cost_usd=o.prices.cost(model, usage)[0], cost_status="estimated", **usage)
         sim["now"] = sunday - 60
         final = o.store.spent(monday, sunday)
-        name = (o.outlook().model or "the seasonal forecast")
     head = [f"Obol demo · made-up usage, nothing saved. Limit ${limit} a week, a usual week is about ${usual:.0f}, "
-            f"this one is {HEAVY:g}× as heavy.", f"  forecast: {name}"]
+            f"this one is {HEAVY:g}× as heavy.", "  forecast: from the usage so far"]
     tail = [f"  With no plugin: ${without:.2f}, ${without - limit:.2f} over the limit.",
             f"  With Obol in save mode: ${final:.2f}."]
     chart = []

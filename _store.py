@@ -84,6 +84,15 @@ class Store:
     def _scope(self, provider: str):
         return ("AND provider = ?", (provider,)) if provider else ("", ())
 
+    def mark_included(self, provider: str) -> int:
+        """A plan pays for these requests: past rows priced at API rates stop counting as dollars. Tokens stay."""
+        with closing(self._conn()) as c, c:
+            n = c.execute("UPDATE calls SET cost_usd=0, cost_status='included' "
+                          "WHERE provider=? AND COALESCE(cost_status,'')!='included'", (provider,)).rowcount
+        if n:
+            self._hourly.clear()
+        return n
+
     def spent(self, since: float, until: float | None = None, provider: str = "") -> float:
         until = time.time() if until is None else until
         where, args = self._scope(provider)

@@ -28,7 +28,7 @@ const data = { state: 'over', at: Date.now() / 1000, rows: [{ title: 'Claude wee
   chart: { title: 'This week', unit: '$', start: 0, end: 100, limit: 20, out_at: 85, actual: [[0, 0], [40, 6.2]],
            expected: [[40, 6.2], [90, 22]], low: [[40, 6.2], [90, 18]], high: [[40, 6.2], [90, 26]] } }
 const html = renderToString(jsx(parts.Details, { data }))
-for (const want of ['<svg', '<polygon', 'out ', 'resets ', 'Shaded', 'Runs out', 'before it resets', 'Resets ', 'Hatched', 'Updated', '40% used', 'stroke-dasharray', 'Forecast: Cascade']) if (!html.includes(want)) throw new Error('missing ' + want)
+for (const want of ['<svg', '<polygon', 'out ', 'resets ', 'Shaded', 'Likely out around', 'before it resets', 'Resets ', 'Hatched', 'Updated', '40% used', 'stroke-dasharray', 'An estimate from Cascade']) if (!html.includes(want)) throw new Error('missing ' + want)
 const demo = renderToString(jsx(parts.Details, { data: { state: 'demo', lines: ['x'], rows: [{ title: 'Week', state: 'over', used: 10, expected: 150, start: 1000, end: 2000, now: 1100, out_at: 1800 }] } }))
 if (!demo.includes('10% of the time')) throw new Error('demo bar ignored its clock')
 const empty = renderToString(jsx(parts.Details, { data: { state: 'none', chip: 'Obol', lines: ['x'] } }))

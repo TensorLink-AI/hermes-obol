@@ -158,7 +158,7 @@ def choose(setting: str, have_key: bool, data_dir: Path, n_hours: int) -> tuple[
     """(tier, note). setting: auto | ephemeris | cascade | seasonal."""
     if n_hours < MIN_HOURS_MODEL and setting in ("auto", "ephemeris", "cascade"):
         return "seasonal", f"the better forecast starts after about {MIN_HOURS_MODEL // 24} days of use"
-    if setting in ("auto", "ephemeris") and have_key:
+    if setting == "ephemeris" and have_key:     # never on `auto`: a key in the environment may be for another tool
         return "ephemeris", ""
     ok, why = cascade_status(data_dir)
     if setting in ("auto", "cascade", "ephemeris") and ok:

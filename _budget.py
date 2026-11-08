@@ -152,7 +152,7 @@ def line(o: Outlook, now: float | None = None) -> str:
     if st == "out":
         return f"{head} · budget used up"
     if st == "unknown":
-        return f"{head} · first forecast after a full hour of use"
+        return f"{head} · too early to forecast (under a day of use)"
     if st == "over":
         tail = f"on track to run out ~{_when(o.out_median, now)}" if o.out_median else "on track to run out"
         return f"{head} · ⚠ {tail}"

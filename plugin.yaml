@@ -27,7 +27,7 @@ config_schema:
     type: float
     default: 0
     label: "Budget (USD)"
-    description: "How much Hermes may spend per period. 0 = no budget: Obol still shows your spend, what's usual and a suggested budget"
+    description: "How much Hermes may spend per period on API keys; Claude and Codex plan usage counts as $0. 0 = no budget: Obol still shows your spend, what's usual and a suggested budget"
   period:
     type: str
     choices: [day, week, month]
@@ -50,7 +50,7 @@ config_schema:
     choices: ["on", "off"]
     default: "on"
     label: "Advanced · read Claude and Codex plan limits"
-    description: "Through Hermes's own login, at most every 5 minutes, only while you use that provider"
+    description: "Through Hermes's own login, at most every 5 minutes while you use that provider, and when you run /obol limits or your first /obol"
   budgets:
     type: list
     default: []
@@ -81,7 +81,7 @@ config_schema:
     choices: [auto, cascade, ephemeris, seasonal]
     default: auto
     label: "Advanced · forecaster"
-    description: "auto: Cascade 4M on this machine, or Ephemeris once you save a key"
+    description: "auto: Cascade 4M on this machine. ephemeris: hosted models, only when chosen here and a key is saved below"
   ephemeris_api_key:
     type: secret
     env: EPHEMERIS_API_KEY

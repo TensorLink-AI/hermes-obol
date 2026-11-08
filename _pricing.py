@@ -6,8 +6,8 @@ First match wins:
      once a day in the background into this plugin's data directory; no key, nothing sent but a GET
   3. built in: a few list prices, for the first run before the catalogue arrives
 
-A model with no price anywhere costs None (reported as unpriced), never a guess. For subscription
-providers these are API-equivalent dollars, not what the subscription bills.
+A model with no price anywhere costs None (reported as unpriced), never a guess. OpenRouter's `:free` variants cost $0.
+Plan and local requests never reach this table: the plugin records them at $0.
 """
 from __future__ import annotations
 
@@ -145,6 +145,8 @@ class Prices:
         m = normalize(model)
         if not m:
             return None
+        if str(model).lower().strip().endswith(":free"):      # normalize drops the tag, which would price the paid model
+            return (0.0, 0.0, 0.0, 0.0)
         for table in (self._mine(), self._catalogue(), BUILTIN):
             r = _match(table, m)
             if r:

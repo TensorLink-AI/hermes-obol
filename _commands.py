@@ -6,6 +6,8 @@ from datetime import datetime
 
 from . import _budget, _demo, _forecast, _limits, _rules
 
+_SECRET = "EPHEMERIS_API_KEY"
+
 TOOL_SCHEMA = {
     "name": "obol_budget",
     "description": ("This agent's spend budget: spent so far, the forecast for the rest of the period, and when "
@@ -20,16 +22,16 @@ HELP = """/obol                     how you're doing
     save:  also switch to a cheaper model when it won't last (set it with /obol cheap <model>)
     stop:  also stop new turns once it's used up
 /obol limits              Claude and Codex plan limits: will they last until they reset?
-/obol topup 5             add $5 to this period
+/obol demo                see what Obol does, on a made-up week (nothing saved)
 /obol pause 2h            take a break from Obol acting (spend is still recorded)
 /obol more                everything else"""
 
 MORE = """/obol cheap <model>       the cheaper model save mode switches to (same provider)
+/obol topup 5             add $5 to this period
 /obol allow               let one held or stopped turn through
 /obol cap 2 | cap off     cap the current task at $2 more
 /obol providers           spend, forecast and price per API
 /obol budget 10 week openrouter   a budget for one API (0 removes it); /obol topup 5 openrouter
-/obol demo                a made-up week, to see what Obol does (nothing saved)
 /obol forecast            the next hours, hour by hour
 /obol models              spend by model this period
 /obol why                 what Obol did lately, and why
@@ -84,7 +86,7 @@ def run(obol, raw_args: str = "") -> str:
                 if period:
                     obol._set("period", period)
                 done = "Budget removed." if usd <= 0 else "Budget saved."
-            return done + "\n" + _status(obol)
+            return done + ("" if usd <= 0 else _plan_note(obol, provider)) + "\n" + _status(obol)
         if cmd == "mode":
             mode = _budget.LEGACY.get(args[1], args[1]) if len(args) > 1 else ""
             if mode not in _budget.MODES:
@@ -99,12 +101,18 @@ def run(obol, raw_args: str = "") -> str:
                 return "Usage: /obol cheap <model id>  (a model on the same provider, e.g. openai/gpt-5-mini)"
             obol._set("cheap_model", args[1])
             obol.store.set_meta("steer_failed", None)
-            return f"Save mode will switch to {args[1]} when the budget won't last."
+            where = obol.store.latest_provider()
+            warn = ("" if not where or obol._can_steer(args[1].split(",")[0].strip(), "", where)
+                    else f"\n⚠ Obol can't switch to this on {where}, so nothing will change while you use it.")
+            return f"Save mode will switch to {args[1]} when the budget won't last.{warn}"
         if cmd == "forecaster":
             if len(args) < 2 or args[1] not in ("auto", "ephemeris", "cascade", "seasonal"):
                 return "Usage: /obol forecaster auto|ephemeris|cascade|seasonal"
             obol._set("forecaster", args[1])
-            return f"Forecaster: {args[1]}."
+            if args[1] != "ephemeris":
+                return f"Forecaster: {args[1]}."
+            return ("Forecaster: ephemeris. Your hourly dollar totals go to Ephemeris, and each forecast spends its credits."
+                    + ("" if obol._secret(_SECRET) else " Save a key first, in Settings → Plugins → Obol."))
         if cmd == "topup" or (cmd == "allow" and len(args) > 1):
             if len(args) < 2:
                 return "Usage: /obol topup 5"
@@ -137,7 +145,8 @@ def run(obol, raw_args: str = "") -> str:
             usd = _amount(args[1])
             obol.store.set_meta("job_cap", {"usd": usd, "since": obol.clock()})
             obol._log("cap", "you", f"${usd:g} from now")
-            return f"Task cap set: at most ${usd:g} more from now. /obol cap off removes it."
+            return (f"Task cap set: at most ${usd:g} more from now, then Obol stops the task. It counts API spend only, "
+                    "not plan usage. /obol cap off removes it.")
         if cmd == "rules":
             lines = ["Rules in force" + (" (your `rules` setting):" if obol._get("rules", []) else
                                          f" (preset for mode {obol.budget().mode}):")]
@@ -172,11 +181,19 @@ def run(obol, raw_args: str = "") -> str:
         return "That needs an amount above zero, e.g. /obol budget 20 week"
 
 
+def _plan_note(obol, provider: str) -> str:
+    p = provider or obol.store.latest_provider()
+    if not obol.on_plan(p):
+        return ""
+    return f"\nYou're on a {_limits.NAMES[p]} plan, so this counts API-key use only. Plan limits need no budget: /obol limits"
+
+
 def _status(obol) -> str:
+    obol.read_limits_if_unknown()
     s = obol.status()
     b = s["budget"]
     if "state" not in s:
-        return "\n".join([_no_budget(obol, s)] + [f"  {w['line']}" for w in s["limits"][:3]])
+        return _no_budget(obol, s)
     lines = [f"Obol · {s['line']}",
              f"  {_budget.ADJ[b['period']]} budget{' on ' + b['provider'] if b['provider'] else ''} · {b['mode']} mode"
              + (f" (switches to {b['cheap_model']})" if b['mode'] == 'save' and b['cheap_model'] else "")]
@@ -211,7 +228,8 @@ def _status(obol) -> str:
     if (s.get("forecaster") in ("cascade", "seasonal") and not s.get("ephemeris_key") and s["state"] == "ok"
             and not obol.store.meta("ephemeris_hint_shown")):       # once, and never while you're short of budget
         obol.store.set_meta("ephemeris_hint_shown", obol.clock())
-        lines.append("  optional: larger hosted forecasting models via Ephemeris (key in Settings → Plugins → Obol)")
+        lines.append("  optional: larger hosted forecasting models via Ephemeris (save a key in Settings → Plugins → Obol, "
+                     "then /obol forecaster ephemeris)")
     if err := s.get("last_error"):
         lines.append(f"  {err['tier']} unavailable ({err['error'][:80]}); using the local forecast")
     return "\n".join(lines)
@@ -229,10 +247,15 @@ def _nice(x: float) -> float:
 def _no_budget(obol, s) -> str:
     """Useful before any setup: what you spend, what's usual, where this week is heading, and a budget to try."""
     u = obol.unbudgeted()
-    lines = ["Obol · no budget yet"]
+    plans = list(dict.fromkeys(_limits.NAMES[w["provider"]] for w in s["limits"]))
+    lines = [f"Obol · {' and '.join(plans)} plan{'s' if len(plans) > 1 else ''}: nothing to set up" if plans
+             else "Obol · no budget yet"]
+    lines += [f"  {w['line']}" for w in s["limits"][:3]]
     lr = s.get("learned")
     if not u.get("spent") and not u.get("usual"):
-        lines.append("  no spend yet. Set a limit now: /obol budget 20 week")
+        lines.append("  on API keys too? Set a dollar limit: /obol budget 20 week" if plans
+                     else "  no spend yet. Set a limit now: /obol budget 20 week")
+        lines.append("  see it work first: /obol demo")
         return "\n".join(lines)
     per = u["period"]
     lines.append(f"  this {per}: {_budget._money(u['spent'])} so far"
@@ -274,7 +297,7 @@ def _providers(obol) -> str:
     per = rows[0]["period"]
     out = [f"By provider, this {per} (each forecast on its own usage, at its own price):"]
     for r in rows:
-        price = f"${r['usd_per_mtok']:.2f}/M tok" if r["usd_per_mtok"] else "unpriced"
+        price = "on a plan" if obol.on_plan(r["provider"]) else f"${r['usd_per_mtok']:.2f}/M tok" if r["usd_per_mtok"] else "unpriced"
         exp = f" → {_budget._money(r['expected'])}" if r["expected"] is not None else ""
         tail = f"   budget: {r['budget']['line']}" if r["budget"] else ""
         out.append(f"  {r['provider']:<14} {_budget._money(r['spent'])}{exp:<12} {price:<14}{tail}")
