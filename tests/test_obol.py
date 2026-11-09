@@ -974,6 +974,51 @@ def test_snapshot_gives_the_panel_a_meter_for_each_limit(make, monkeypatch):
     assert budget["amount"].startswith("$") and budget["used"] > 0
 
 
+def _windows(o, *rows):
+    o.store.set_meta("limits:anthropic", {"read_at": o.clock(), "tried_at": o.clock(), "error": None, "settled": True, "log": {},
+                                          "windows": [{"label": l, "used": u, "scope": "account", "reset_at": r and o.clock() + r} for l, u, r in rows]})
+
+
+def test_the_panel_graphs_the_week_while_the_chip_follows_the_session(make):
+    o = make()
+    _windows(o, ("Current session", 100.0, HOUR), ("Current week", 40.0, 3 * 86400))
+    s = o.desktop_snapshot()
+    assert s["state"] == "out" and s["chip"].startswith("Claude current session 100%")
+    assert s["chart"]["title"] == "Claude current week" and s["chart"]["end"] - s["chart"]["start"] == 7 * 86400
+    assert len(s["rows"]) == 2
+
+
+def test_the_week_gets_the_graph_past_a_budget_that_is_not_the_most_urgent(make):
+    o = make({"budget_usd": 1000, "period": "week"})
+    feed(o, 40, 0.5)
+    _windows(o, ("Current session", 100.0, HOUR), ("Current week", 40.0, 3 * 86400))
+    assert o.desktop_snapshot()["chart"]["title"] == "Claude current week"
+
+
+def test_the_most_urgent_budget_keeps_the_graph(make):
+    o = make({"budget_usd": 30, "period": "week"})
+    feed(o, 40, 0.5)
+    _windows(o, ("Current week", 40.0, 3 * 86400))
+    s = o.desktop_snapshot()
+    assert s["state"] == "over" and s["chart"]["unit"] == "$" and s["chart"]["limit"] == 30
+
+
+def test_a_week_with_no_reset_time_leaves_the_graph_to_the_session(make):
+    o = make()
+    _windows(o, ("Current session", 90.0, HOUR), ("Current week", 40.0, None))
+    assert o.desktop_snapshot()["chart"]["title"] == "Claude current session"
+
+
+def test_the_panel_names_the_forecast_behind_the_graph(make, monkeypatch):
+    o = make()
+    _windows(o, ("Current session", 100.0, HOUR), ("Current week", 40.0, 3 * 86400))
+    real = o.limit_windows
+    def marked(p, **kw):
+        return [dict(w, how="forecast" if "week" in w["label"] else "pace") for w in real(p, **kw)]
+    monkeypatch.setattr(o, "limit_windows", marked)
+    assert o.desktop_snapshot()["forecast"] == "your token history"
+
+
 # ── subscription plans, API keys and other providers ─────────────────────────
 PLAN = {"read_at": 1.0, "tried_at": 1.0, "error": None, "settled": True, "log": {},
         "windows": [{"label": "Current week", "used": 10.0, "scope": "account", "reset_at": 9e9}]}

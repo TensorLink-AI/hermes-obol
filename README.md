@@ -54,7 +54,7 @@ with the `obol_budget` tool. After upgrading, restart Hermes and its gateway so 
 ## Hermes Desktop
 
 A chip in the status bar shows whichever budget or plan limit is closest to running out, like `$6.20/$20 · out ~Fri 14:00`.
-Click it for the chart: use so far, the forecast, and when it crosses the limit, for a budget or a Claude or Codex window.
+Click it for the chart: use so far, the forecast, and when it crosses the limit, for a budget or a Claude or Codex window. It shows your weekly limit when you have one, unless a budget you set is the most urgent.
 The shaded range is how much your own past periods varied, and appears once there are four to measure. If a limit is about
 to go, it also shows a notification. `/obol demo` puts a made-up heavy week on the chip for 5 minutes, labelled as a demo.
 

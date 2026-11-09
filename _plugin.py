@@ -37,6 +37,7 @@ LIMITS_EVERY = 5 * 60            # at most one read of a provider's plan limits 
 LIMITS_STALE = HOUR              # older than this, a reading is shown but not acted on
 ALLOW_FOR = HOUR                 # /obol allow: how long it waits for a turn, and how long that turn's tools run
 # Providers that serve only their own models. Routers (OpenRouter and the like) can serve anything.
+WEEK = 7 * 24 * HOUR
 FORECAST_AFTER = 24 * HOUR       # with less history than this, one busy hour would be repeated all week
 LOCAL_PROVIDERS = ("local", "ollama", "lmstudio", "llamacpp", "vllm")
 # Providers that serve many vendors' models. `demo` is /obol demo's made-up provider.
@@ -235,6 +236,19 @@ class Obol:
             chart.update(_forecast.band(chart["expected"], _forecast.spread(past, now, reset)))
         return chart
 
+    def _panel_chart(self, rows: list) -> tuple:
+        """The panel's one graph, and the row it's for. A week is the limit you can still plan around, so a short
+        window only takes the graph when there's no weekly one; a budget that's the most urgent thing keeps it."""
+        top = rows[0]
+        if top["budget"]:
+            return self._chart(top["budget"]), top
+        for r in rows:
+            if r.get("window") and _limits.length(r["window"]["label"]) == WEEK:
+                chart = self._window_chart(r["window"])
+                if chart:
+                    return chart, r
+        return self._window_chart(top["window"]), top
+
     def show_demo(self, snapshot: dict) -> None:
         """Put /obol demo's made-up chart on the chip for a few minutes. It's labelled, and it can't raise an alert."""
         self.store.set_meta("demo_chip", {"until": self.clock() + DEMO_FOR, "snapshot": snapshot})
@@ -271,6 +285,7 @@ class Obol:
                     "lines": ["Claude and Codex plan limits appear after your first request. "
                               f"On API keys? Try /obol budget 20 {u['period']}"]}
         top = rows[0]
+        chart, charted = self._panel_chart(rows)
         chip = top["chip"]
         if top["state"] == "out":
             chip += " · used up"
@@ -278,8 +293,8 @@ class Obol:
             chip += f" · out ~{when(top['out'], now)}"
         return {"state": top["state"], "chip": chip, "at": now, "lines": [r["line"] for r in rows[:4]],
                 "rows": [dict(r["meter"], state=r["state"]) for r in rows[:4] if r["meter"]],
-                "forecast": top["model"] or "",
-                "chart": self._chart(top["budget"]) if top["budget"] else self._window_chart(top["window"])}
+                "forecast": charted["model"] or top["model"] or "",
+                "chart": chart}
 
     def write_desktop(self, every: float = 0) -> None:
         """Leave the chip's data where the Desktop backend can serve it, without opening the ledger itself."""
