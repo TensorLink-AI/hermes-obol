@@ -28,9 +28,10 @@ const data = { state: 'over', at: Date.now() / 1000, rows: [{ title: 'Claude wee
   chart: { title: 'This week', unit: '$', start: 0, end: 100, limit: 20, out_at: 85, actual: [[0, 0], [40, 6.2]],
            expected: [[40, 6.2], [90, 22]], low: [[40, 6.2], [90, 18]], high: [[40, 6.2], [90, 26]] } }
 const html = renderToString(jsx(parts.Details, { data }))
-for (const want of ['<svg', '<polygon', 'out ', 'resets ', 'Shaded', 'Likely out around', 'before it resets', 'Resets ', 'Hatched', 'Updated', '40% used', 'stroke-dasharray', 'An estimate from Cascade']) if (!html.includes(want)) throw new Error('missing ' + want)
+for (const want of ['<svg', '<polygon', 'out ', 'resets ', 'Shaded', 'Likely out around', 'before it resets', 'Resets ', 'Hatched', 'Updated', '40% used', 'stroke-dasharray', 'An estimate from Cascade', 'Solid: used so far', 'width:40%', '40% used, likely out around']) if (!html.includes(want)) throw new Error('missing ' + want)
 const demo = renderToString(jsx(parts.Details, { data: { state: 'demo', lines: ['x'], rows: [{ title: 'Week', state: 'over', used: 10, expected: 150, start: 1000, end: 2000, now: 1100, out_at: 1800 }] } }))
-if (!demo.includes('10% of the time')) throw new Error('demo bar ignored its clock')
+if (!demo.includes('10% used, likely out around') || !demo.includes('width:10%')) throw new Error('bar does not show usage')
+if (html.includes('time left until')) throw new Error('old runway caption')
 const empty = renderToString(jsx(parts.Details, { data: { state: 'none', chip: 'Obol', lines: ['x'] } }))
 if (!empty.includes('Type /obol') || !empty.includes('>x<')) throw new Error('bad empty panel')
 const plan = renderToString(jsx(parts.Details, { data: { state: 'out', chip: 'x', lines: ['x'], chart: { title: 'w', unit: '%', start: 0, end: 100,
@@ -48,7 +49,7 @@ const fresh = renderToString(jsx(parts.Details, { data: { state: 'ok', lines: ['
 if (!fresh.includes('Too early to say')) throw new Error('no verdict copy on a fresh window')
 const paced = renderToString(jsx(parts.Details, { data: { state: 'ok', lines: ['x'], rows: [{ title: 'W', state: 'ok', used: 20, expected: 40, how: 'pace', age: '2h', start: noon - 3600, end: noon + 3600 }] } }))
 if (!paced.includes('at your pace so far') || !paced.includes('20% used (2h ago)')) throw new Error('basis or age missing')
-if (!html.includes('not how much is used')) throw new Error('bars must say they are time')
+if (!paced.includes('opacity:0.35') || !paced.includes('heading for about 40%')) throw new Error('no forecast segment on the bar')
 if (!html.includes('$6.20 so far') || !html.includes('heading for $22.00')) throw new Error('chart label has no values')
 if (html.includes('Dollar figures')) throw new Error('plan rows have no dollars')
 if (!budget.includes('Dollar figures')) throw new Error('dollar rows must say what the dollars are')

@@ -1396,7 +1396,7 @@ def test_plan_window_chart_runs_from_its_readings_to_the_forecast(make, monkeypa
     _plan(o, monkeypatch, used=30, reset_in=2 * HOUR)
     s = o.desktop_snapshot()
     c = s["chart"]
-    assert c["title"] == "Claude current session" and c["end"] - c["start"] == 5 * HOUR
+    assert c["title"] == "Claude session" and c["end"] - c["start"] == 5 * HOUR
     assert c["actual"][-1] == c["expected"][0] and c["expected"][-1][0] == c["end"] and c["expected"][-1][1] == 50
     assert s["forecast"] == "your pace so far"
     assert all("path" not in w for w in o.limit_windows("anthropic"))     # kept out of what the agent is told
@@ -1456,7 +1456,7 @@ def test_the_panel_graphs_the_week_while_the_chip_follows_the_session(make):
     _windows(o, ("Current session", 100.0, HOUR), ("Current week", 40.0, 3 * 86400))
     s = o.desktop_snapshot()
     assert s["state"] == "out" and s["chip"].startswith("Claude session 100%")
-    assert s["chart"]["title"] == "Claude current week" and s["chart"]["end"] - s["chart"]["start"] == 7 * 86400
+    assert s["chart"]["title"] == "Claude week" and s["chart"]["end"] - s["chart"]["start"] == 7 * 86400
     assert len(s["rows"]) == 2
 
 
@@ -1464,7 +1464,7 @@ def test_the_week_gets_the_graph_past_a_budget_that_is_not_the_most_urgent(make)
     o = make({"budget_usd": 1000, "period": "week"})
     feed(o, 40, 0.5)
     _windows(o, ("Current session", 100.0, HOUR), ("Current week", 40.0, 3 * 86400))
-    assert o.desktop_snapshot()["chart"]["title"] == "Claude current week"
+    assert o.desktop_snapshot()["chart"]["title"] == "Claude week"
 
 
 def test_the_most_urgent_budget_keeps_the_graph(make):
@@ -1478,7 +1478,7 @@ def test_the_most_urgent_budget_keeps_the_graph(make):
 def test_a_week_with_no_reset_time_leaves_the_graph_to_the_session(make):
     o = make()
     _windows(o, ("Current session", 90.0, HOUR), ("Current week", 40.0, None))
-    assert o.desktop_snapshot()["chart"]["title"] == "Claude current session"
+    assert o.desktop_snapshot()["chart"]["title"] == "Claude session"
 
 
 def test_the_panel_names_the_forecast_behind_the_graph(make, monkeypatch):

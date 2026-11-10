@@ -236,7 +236,7 @@ class Obol:
         now = self.clock()
         log = ((self.store.meta(f"limits:{w['provider']}") or {}).get("log") or {}).get(w["label"]) or {}
         actual = [[reset - size, 0.0]] + (log.get("points") or [])[-200:] + [[now, w["used"]]]
-        chart = {"title": w["name"], "unit": "%", "start": reset - size, "end": reset, "limit": 100.0, "actual": actual,
+        chart = {"title": w["name"].replace(" current ", " "), "unit": "%", "start": reset - size, "end": reset, "limit": 100.0, "actual": actual,
                  "expected": w.get("path") or [], "out_at": w.get("out_at")}
         if w.get("how") == "forecast":
             past = self.store.hourly_tokens(until=now, provider=w["provider"])

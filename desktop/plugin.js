@@ -82,28 +82,32 @@ function around(t, span, now = Date.now() / 1000) {
   return when(down >= now ? down : t, span)
 }
 
-const share = (t, row) => Math.max(0, Math.min(100, ((t - row.start) / (row.end - row.start)) * 100))
 const nowS = () => Date.now() / 1000
 
-// A runway, not a usage bar: the track is the time until the reset. Filled has passed; hatched is time with nothing left to spend.
+// A usage bar: solid is used so far, faded is the forecast to the reset, hatched is where the forecast runs out.
 function Runway({ row, height = 8, decorative = false }) {
-  const passed = share(row.now ?? nowS(), row)   // the demo's week runs on its own clock
-  const dryFrom = row.state === 'out' ? passed : row.out_at ? Math.max(passed, share(row.out_at, row)) : null
+  const clamp = v => Math.max(0, Math.min(100, v))
+  const used = row.state === 'out' ? 100 : clamp(row.used ?? 0)
+  const runsOut = row.state !== 'out' && (row.out_at || (row.expected ?? 0) >= 100)
+  const ahead = row.expected == null || runsOut ? used : clamp(row.expected)
   const fill = HOT[row.state] || 'var(--ui-text-secondary)'
   const bar = (left, width, extra) => ({ position: 'absolute', top: 0, bottom: 0, left: `${left}%`, width: `${width}%`, ...extra })
-  const ending = row.state === 'out' ? ', and it is used up' : row.out_at ? `, likely out around ${around(row.out_at, row.end - row.start, row.now ?? nowS())}` : ''
+  const said = row.state === 'out'
+    ? 'used up'
+    : `${Math.round(row.used ?? 0)}% used${row.out_at ? `, likely out around ${around(row.out_at, row.end - row.start, row.now ?? nowS())}` : runsOut ? ', likely to run out before the reset' : row.expected != null ? `, heading for about ${Math.round(row.expected)}% at the reset` : ''}`
   return jsxs('div', {
-    ...(decorative ? { 'aria-hidden': true } : { role: 'img', 'aria-label': `${Math.round(passed)}% of the time until the reset has passed${ending}` }),
+    ...(decorative ? { 'aria-hidden': true } : { role: 'img', 'aria-label': said }),
     style: { position: 'relative', height, borderRadius: 2, background: 'var(--ui-stroke-secondary)', overflow: 'hidden' },
     children: [
-      jsx('div', { style: bar(0, passed, { background: fill }) }),
-      dryFrom === null
-        ? null
-        : jsx('div', {
-            style: bar(dryFrom, 100 - dryFrom, {
+      jsx('div', { style: bar(0, used, { background: fill }) }),
+      ahead > used ? jsx('div', { style: bar(used, ahead - used, { background: fill, opacity: 0.35 }) }) : null,
+      runsOut
+        ? jsx('div', {
+            style: bar(used, 100 - used, {
               background: 'repeating-linear-gradient(135deg, var(--ui-accent) 0 2px, transparent 2px 4px)'
             })
           })
+        : null
     ]
   })
 }
@@ -199,7 +203,7 @@ function Details({ data, panelRef }) {
       rows.length
         ? jsx('div', {
             className: 'text-(--ui-text-tertiary)',
-            children: `Bars show the time left until each reset, not how much is used.${rows.some(r => r.out_at || r.state === 'out') ? ' Hatched: out of tokens.' : ''}`
+            children: `Solid: used so far. Faded: forecast to the reset.${rows.some(r => r.out_at || (r.state !== 'out' && (r.expected ?? 0) >= 100)) ? ' Hatched: the forecast runs out.' : ''}`
           })
         : null,
       data.chart
