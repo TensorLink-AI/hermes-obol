@@ -36,5 +36,6 @@ def make(tmp_path):
                           set_=cfg.__setitem__, secret=lambda n: secret, clock=clock)
         o.cfg, o.clock_obj = cfg, clock
         o.prices.stale = lambda now=None: False   # tests never fetch the catalogue
+        o._hold_first_switch = lambda *a: False   # steering tests start past the warning; its own tests delete this
         return o
     return make

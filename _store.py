@@ -196,11 +196,27 @@ class Store:
             return c.execute(f"SELECT model, COUNT(*), SUM(COALESCE(cost_usd,0)) FROM calls WHERE ts>=? {where} "
                              "GROUP BY model ORDER BY 3 DESC", (since, *args)).fetchall()
 
+    def has_served(self, provider: str, model: str) -> bool:
+        with closing(self._conn()) as c:
+            return c.execute("SELECT 1 FROM calls WHERE provider=? AND model=? LIMIT 1", (provider, model)).fetchone() is not None
+
     # ── meta ─────────────────────────────────────────────────────────────────
     def meta(self, key: str, default=None):
         with closing(self._conn()) as c:
             row = c.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()
         return json.loads(row[0]) if row else default
+
+    def add_to_meta(self, key: str, amount: float) -> None:
+        """In one statement: two Hermes processes adding at once must both count."""
+        with closing(self._conn()) as c, c:
+            c.execute("INSERT INTO meta VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=CAST(v AS REAL)+excluded.v",
+                      (key, json.dumps(float(amount))))
+
+    def claim(self, key: str, now: float, ttl: float) -> bool:
+        """True for exactly one caller at a time, across processes, until `ttl` has passed or the claim is reset to 0."""
+        with closing(self._conn()) as c, c:
+            return c.execute("INSERT INTO meta VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v "
+                             "WHERE CAST(meta.v AS REAL) < ?", (key, json.dumps(now), now - ttl)).rowcount == 1
 
     def set_meta(self, key: str, value) -> None:
         with closing(self._conn()) as c, c:

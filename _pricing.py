@@ -2,8 +2,9 @@
 
 First match wins:
   1. yours: the `prices` setting, {model: [input, output, cache_read]} in $ per million tokens
-  2. OpenRouter's public model catalogue (every model it lists, from every provider), fetched at most
-     once a day in the background into this plugin's data directory; no key, nothing sent but a GET
+  2. OpenRouter's public model catalogue (every model it lists, from every provider), fetched in the background
+     at most once a day (hourly while the fetch is failing) into this plugin's data directory; no key, nothing sent
+     but a GET. The `price_list` setting turns it off
   3. built in: a few list prices, for the first run before the catalogue arrives
 
 A model with no price anywhere costs None (reported as unpriced), never a guess. OpenRouter's `:free` variants cost $0.
@@ -21,6 +22,7 @@ from pathlib import Path
 
 CATALOGUE_URL = "https://openrouter.ai/api/v1/models"
 REFRESH_SECONDS = 86400
+RETRY_SECONDS = 3600            # after a failed fetch
 
 # (input, output, cache_read, cache_write) $ per million
 BUILTIN = {
@@ -41,7 +43,8 @@ def normalize(model: str | None) -> str:
 
 def _pm(v):
     try:
-        return float(v) * 1e6
+        x = float(v) * 1e6
+        return None if x < 0 else x                 # the catalogue's -1 means "varies", as for openrouter/auto
     except (TypeError, ValueError):
         return None
 
@@ -103,28 +106,31 @@ class Prices:
                 req = urllib.request.Request(CATALOGUE_URL, headers={"User-Agent": "hermes-obol"})
                 with urllib.request.urlopen(req, timeout=30) as r:
                     rates = parse_catalogue(json.load(r).get("data") or [])
-                if rates:
-                    self.path.parent.mkdir(parents=True, exist_ok=True)
-                    tmp = self.path.with_suffix(".tmp")
-                    tmp.write_text(json.dumps({"fetched_at": time.time(), "rates": rates}))
-                    tmp.replace(self.path)
-                    self._table = {k: tuple(v) for k, v in rates.items()}
-                    if on_done:
-                        on_done()
+                if not rates:
+                    raise ValueError("empty price list")
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.path.with_suffix(".tmp")
+                tmp.write_text(json.dumps({"fetched_at": time.time(), "rates": rates}))
+                tmp.replace(self.path)
+                self._table = {k: tuple(v) for k, v in rates.items()}
+                if on_done:
+                    on_done()
             except Exception:
-                # offline or the catalogue is unavailable: built-in prices still apply; retried next day
-                try:
-                    self.path.parent.mkdir(parents=True, exist_ok=True)
-                    if not self.path.exists():
-                        self.path.write_text(json.dumps({"fetched_at": time.time() - REFRESH_SECONDS + 3600,
-                                                         "rates": {}}))
-                except Exception:
-                    pass
+                self._note_failure()
             finally:
                 with self._lock:
                     self._fetching = False
 
         threading.Thread(target=run, name="obol-prices", daemon=True).start()
+
+    def _note_failure(self) -> None:
+        """Offline, or the list is down: keep the prices we have and wait an hour, or every request would try again."""
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps({"fetched_at": time.time() - REFRESH_SECONDS + RETRY_SECONDS,
+                                             "rates": self._catalogue()}))
+        except Exception:
+            pass
 
     def _mine(self) -> dict:
         """The `prices` setting; a malformed entry is skipped, never raised (a hook must keep metering)."""

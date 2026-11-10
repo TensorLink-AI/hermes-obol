@@ -4,8 +4,10 @@ Hermes reads the window from the vendor with the login it already holds (`agent.
 for this); Obol never sees a credential. The vendor's figure counts every client on the account, not just Hermes.
 
 Projection: the window's percent so far, per token Hermes sent in it, applied to the token forecast for the hours
-until it resets (means add up; per-hour quantiles are never added). If Hermes sent next to nothing in the window, the
-use came from somewhere else and the token forecast says nothing about it, so fall back to the pace so far.
+until it resets (means add up; per-hour quantiles are never added). That only holds if Hermes is what's filling the
+window. Stored readings taken while Hermes was busy show how much each Hermes token really moves the percent: if that
+explains under half of the window, the use came from somewhere else and the token forecast says nothing about it, so
+use the pace so far. Until the readings can tell, take whichever of the two is higher.
 """
 from __future__ import annotations
 
@@ -17,6 +19,9 @@ NAMES = {"anthropic": "Claude", "openai-codex": "Codex"}
 MIN_TOKENS = 10_000             # below this, Hermes's own share of the window is too small to scale from
 MIN_ELAPSED = 0.05              # too early in a window to read a pace
 TIGHT = 85.0
+MAX_GAP = 1800                  # readings further apart than this span time Hermes was idle and other apps may not have been
+MIN_RISE = 2.0                  # percentage points seen while Hermes was busy, before they count as evidence for it
+MIN_SHARE = 0.5                 # below this share of the window, Hermes isn't what's filling it
 
 
 def read(provider: str) -> dict:
@@ -27,7 +32,7 @@ def read(provider: str) -> dict:
     except Exception as e:
         return {"windows": [], "error": f"couldn't read it ({type(e).__name__})"}
     if snap is None:
-        return {"windows": [], "error": "not signed in to Hermes"}
+        return {"windows": [], "error": "not signed in to Hermes, or the vendor didn't answer"}
     if getattr(snap, "unavailable_reason", None):
         return {"windows": [], "error": str(snap.unavailable_reason)[:160]}
     rows = [{"label": w.label, "used": float(w.used_percent), "scope": getattr(w, "scope", "account"),
@@ -75,41 +80,72 @@ def length(label: str) -> float | None:
     return None
 
 
+def drives(points: list, tokens_between, tokens_in: float, used: float) -> str | None:
+    """Is Hermes what's filling this window? "hermes", "elsewhere", or None when the readings can't tell yet.
+
+    Readings only happen around Hermes requests, so pairs close together are time Hermes was busy. The percent they
+    gained per token sent is the most each Hermes token can cost; scaled by every Hermes token in the window, that's
+    the most of the window Hermes can account for. The extra point allows for vendors reporting whole percents."""
+    busy = [(a, b) for a, b in zip(points, points[1:]) if b[0] - a[0] <= MAX_GAP]
+    rise = sum(max(0.0, b[1] - a[1]) for a, b in busy)
+    sent = sum(tokens_between(a[0], b[0]) for a, b in busy)
+    if not sent or used <= 0:
+        return None
+    if (rise + 1) / sent * tokens_in / used < MIN_SHARE:
+        return "elsewhere"
+    return "hermes" if rise >= MIN_RISE else None
+
+
 def project(used: float, now: float, reset_at: float | None, size: float | None, tokens_in: float,
-            path: list | None, path_start: float | None, tokens_this_hour: float = 0.0) -> dict:
+            path: list | None, path_start: float | None, tokens_this_hour: float = 0.0,
+            source: str | None = "hermes") -> dict:
     """{"expected": percent at reset or None, "out_at": when it reaches 100 or None, "how": "forecast"|"pace"|"",
-    "path": [[time, percent]] from now to the reset}."""
-    out = {"expected": None, "out_at": None, "how": "", "path": []}
+    "path": [[time, percent]] from now to the reset}. `source` is what `drives` said about this window."""
+    blank = {"expected": None, "out_at": None, "how": "", "path": []}
     if used >= 100 or not reset_at or reset_at <= now:
-        return out
-    if path and path_start is not None and tokens_in >= MIN_TOKENS and used > 0:
-        rate, total, current = used / tokens_in, used, int(now // HOUR) * HOUR
-        out["path"].append([now, round(total, 2)])
-        for i, tok in enumerate(path):
-            h = path_start + i * HOUR
-            if tok is None or h + HOUR <= now:
-                continue
-            if h >= reset_at:
-                break
-            tok = max(0.0, tok - tokens_this_hour) if h == current else tok
-            if h + HOUR > reset_at:                 # only part of this hour falls inside the window
-                tok *= (reset_at - max(h, now)) / (h + HOUR - max(h, now))
-            add = tok * rate
-            if out["out_at"] is None and total + add >= 100 > total and add > 0:
-                out["out_at"] = max(now, h) + (min(h + HOUR, reset_at) - max(now, h)) * (100 - total) / add
-            total += add
-            out["path"].append([min(h + HOUR, reset_at), round(total, 2)])
-        out.update(expected=total, how="forecast")
-        return out
-    if size:
-        elapsed = size - (reset_at - now)
-        if elapsed >= MIN_ELAPSED * size and used > 0:
-            per_second = used / elapsed
-            expected = used + per_second * (reset_at - now)
-            out.update(expected=expected, how="pace", path=[[now, round(used, 2)], [reset_at, round(expected, 2)]])
-            if expected >= 100:
-                out["out_at"] = now + (100 - used) / per_second
+        return blank
+    by_forecast = None if source == "elsewhere" else _by_forecast(
+        used, now, reset_at, tokens_in, path, path_start, tokens_this_hour)
+    by_pace = _by_pace(used, now, reset_at, size)
+    if by_forecast and (source == "hermes" or not by_pace or by_forecast["expected"] >= by_pace["expected"]):
+        return by_forecast
+    return by_pace or blank
+
+
+def _by_forecast(used, now, reset_at, tokens_in, path, path_start, tokens_this_hour) -> dict | None:
+    if not (path and path_start is not None and tokens_in >= MIN_TOKENS and used > 0):
+        return None
+    out = {"expected": None, "out_at": None, "how": "forecast", "path": []}
+    rate, total, current = used / tokens_in, used, int(now // HOUR) * HOUR
+    out["path"].append([now, round(total, 2)])
+    for i, tok in enumerate(path):
+        h = path_start + i * HOUR
+        if tok is None or h + HOUR <= now:
+            continue
+        if h >= reset_at:
+            break
+        tok = max(0.0, tok - tokens_this_hour) if h == current else tok
+        if h + HOUR > reset_at:                 # only part of this hour falls inside the window
+            tok *= (reset_at - max(h, now)) / (h + HOUR - max(h, now))
+        add = tok * rate
+        if out["out_at"] is None and total + add >= 100 > total and add > 0:
+            out["out_at"] = max(now, h) + (min(h + HOUR, reset_at) - max(now, h)) * (100 - total) / add
+        total += add
+        out["path"].append([min(h + HOUR, reset_at), round(total, 2)])
+    out["expected"] = total
     return out
+
+
+def _by_pace(used, now, reset_at, size) -> dict | None:
+    if not size or used <= 0:
+        return None
+    elapsed = size - (reset_at - now)
+    if elapsed < MIN_ELAPSED * size:
+        return None
+    per_second = used / elapsed
+    expected = used + per_second * (reset_at - now)
+    return {"expected": expected, "how": "pace", "path": [[now, round(used, 2)], [reset_at, round(expected, 2)]],
+            "out_at": now + (100 - used) / per_second if expected >= 100 else None}
 
 
 def state(used: float, expected: float | None) -> str:

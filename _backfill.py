@@ -51,6 +51,7 @@ def import_history(store, data_dir: Path, price, now: float) -> dict:
                  "cache_write_tokens": cw or 0}
         if not any(usage.values()) and not (actual or est):
             continue                                            # a session that never reached a model
+        actual, est = (None if v is None or v < 0 else v for v in (actual, est))   # -1 is Hermes's "unknown"
         usd = actual if actual is not None else est
         status = "hermes-reported" if actual is not None else "hermes-estimated"
         if usd is None:

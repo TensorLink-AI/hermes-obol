@@ -13,7 +13,7 @@ from fastapi import APIRouter
 from hermes_constants import get_hermes_home
 
 router = APIRouter()
-EMPTY = {"state": "none", "chip": "Obol", "lines": ["No usage recorded yet. Plan limits appear after your first request. On API keys? /obol budget 20 week"]}
+EMPTY = {"state": "none", "chip": "Obol", "lines": ["No usage recorded yet. Type /obol in any session to start. Plan limits appear after your first request. On API keys? /obol budget 20 week"]}
 
 
 def snapshot(home: Path) -> dict:

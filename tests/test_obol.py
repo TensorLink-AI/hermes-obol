@@ -153,7 +153,7 @@ def test_cascade_numpy_matches_torch_reference():
         got = _cascade.model(case["model"]).quantiles(case["history"], case["horizon"])
         want = np.array(case["torch_quantiles"])               # float32 torch reference; weights ship as float16
         assert got.shape == want.shape
-        assert np.abs(got - want).max() <= 5e-3 * (np.abs(want).max() + 1e-6), (case["model"], case["name"])
+        assert np.abs(got - want).max() <= 2.5e-3 * (np.abs(want).max() + 1e-6), (case["model"], case["name"])
 
 
 def test_cascade_is_the_default_local_forecaster(make):
@@ -253,6 +253,27 @@ def test_rule_conditions_and_ladder():
     assert [_rules.steer_target(ladder, s) for s in ("tight", "over", "out")] == ["mid/model", "cheap/model", "cheap/model"]
 
 
+@pytest.mark.parametrize("when,want", [
+    ({"stat": "out"}, 'no condition called "stat"'),
+    ({"state": ["tight", "ovr"]}, '"ovr" isn\'t a state'),
+    ({"runs_out_within": "soon"}, "isn't a length of time"),
+    ({"spent_pct": "lots"}, "isn't a number"),
+    ({"request_usd": True}, "isn't a number"),
+])
+def test_obol_rules_says_when_a_rule_can_never_fire(make, when, want):
+    o = make({"budget_usd": 30, "period": "week", "rules": [{"name": "mine", "when": when, "do": "block"}]})
+    assert "can never fire" in _commands.run(o, "rules") and want in _commands.run(o, "rules")
+
+
+@pytest.mark.parametrize("when", [
+    {"state": ["tight", "over"]}, {"state": "o*"}, {"runs_out_within": "2h"}, {"spent_pct": ">=80"}, {"request_usd": 0.5},
+    {"day_vs_usual": ">3x"}, {"provider": "open*", "model": "a/*", "platform": "cli", "aux": False}, {},
+])
+def test_good_rules_get_no_warning(make, when):
+    o = make({"budget_usd": 30, "period": "week", "rules": [{"name": "mine", "when": when, "do": "block"}]})
+    assert "can never fire" not in _commands.run(o, "rules")
+
+
 def test_custom_rules_replace_the_preset(make):
     o = make({"budget_usd": 30, "period": "week", "rules": [
         {"name": "ladder", "when": {"state": ["tight", "over", "out"]}, "do": {"steer": ["mid/m", "cheap/m"]}},
@@ -261,7 +282,7 @@ def test_custom_rules_replace_the_preset(make):
     r = o.llm_request(request={"model": "big/m", "messages": [{"content": "hi"}]}, provider="openrouter")
     assert r["request"]["model"] == "cheap/m"
     assert o.pre_llm_call(session_id="s1") is None                       # bogus block rule never fires
-    assert "malformed" in _commands.run(o, "rules") and "ladder" in _commands.run(o, "rules")
+    assert "rule 3 is ignored" in _commands.run(o, "rules") and "ladder" in _commands.run(o, "rules")
     assert "steer" in _commands.run(o, "why")
 
 
@@ -317,13 +338,13 @@ def test_ask_rule_escalates_tools_to_approval(make):
     o = make({"budget_usd": 30, "period": "week", "rules": [{"when": {"state": ["over", "out"]}, "do": "ask"}]})
     feed(o, 40, 0.5)
     r = o.pre_tool_call(tool_name="terminal")
-    assert r["action"] == "approve" and r["rule_key"] == "obol"
+    assert r["action"] == "approve" and r["rule_key"].startswith("obol:")
 
 
 def test_simple_surface_and_legacy_names(make):
     o = make()
-    assert len(_commands.HELP.splitlines()) <= 10 and "/obol more" in _commands.HELP
-    assert "/obol why" in _commands.run(o, "more")
+    assert len(_commands.HELP.splitlines()) <= 11 and "/obol more" in _commands.HELP
+    assert "/obol why" in _commands.HELP
     assert "Mode: save" in _commands.run(o, "mode steer")          # old names still work
     assert o.budget().mode == "save" and "cheaper model" in _commands.run(o, "mode save")
     o.cfg["mode"] = "guard"
@@ -670,6 +691,457 @@ def test_use_from_other_clients_falls_back_to_pace():
     assert early["expected"] is None and _limits.state(1, early["expected"]) == "ok"
 
 
+def _window(o, used, reset_in, size_h, readings, calls, path_per_hour, monkeypatch, label="Current week"):
+    """A window with stored readings and real ledger rows, projected through the real limit_windows."""
+    now, reset = o.clock(), o.clock() + reset_in
+    for ts, tokens in calls:
+        o.store.add_call(ts=ts, session_id="s", provider="anthropic", model="m", input_tokens=tokens, cost_usd=0, cost_status="included")
+    o.store.set_meta("limits:anthropic", {"read_at": now, "tried_at": now, "settled": True, "error": None,
+                                          "windows": [{"label": label, "used": used, "scope": "account", "reset_at": reset}],
+                                          "log": {label: {"reset": reset, "points": readings}}})
+    monkeypatch.setattr(o, "_token_path", lambda p: {"start": int(now // HOUR) * HOUR, "mean": [path_per_hour] * 168})
+    return o.limit_windows("anthropic", with_path=True)[0]
+
+
+def test_mostly_claude_code_doesnt_read_on_track(make, monkeypatch):
+    """60% used with Hermes barely involved: rises happen between Hermes's bursts, none while it's busy."""
+    o = make()
+    now, days = o.clock(), 86400
+    t1, t2 = now - 2 * days, now - 3600
+    w = _window(o, 60.0, 4 * days, 168, [[t1, 40.0], [t1 + 600, 40.0], [t2, 60.0], [t2 + 600, 60.0]],
+                [(t1 + 300, 6_000), (t1 - 60, 8_000), (t2 + 300, 6_000)], 200, monkeypatch)
+    assert w["how"] == "pace" and w["state"] == "over"
+    assert w["expected"] == pytest.approx(60 + 60 / 3 * 4)
+    assert "at your pace so far" in w["line"]
+
+
+def test_all_hermes_keeps_the_forecast_even_when_pace_is_higher(make, monkeypatch):
+    """The point of forecasting: a heavy start doesn't mean a heavy rest of the week."""
+    o = make()
+    now, days = o.clock(), 86400
+    t = now - 3 * HOUR
+    points = [[t + i * 600, 20.0 + i * 3.0] for i in range(8)]
+    calls = [(t + i * 600 + 300, 300_000) for i in range(7)] + [(t - 3600, 1_000_000)]
+    w = _window(o, 41.0, 6.5 * days, 168, points, calls, 100, monkeypatch)
+    assert w["how"] == "forecast" and w["state"] == "ok"
+    assert "pace" not in w["line"]
+
+
+@pytest.mark.parametrize("per_hour,how", [(0, "pace"), (2_000_000, "forecast")])
+def test_with_no_readings_yet_the_higher_estimate_wins(make, monkeypatch, per_hour, how):
+    o = make()
+    now, days = o.clock(), 86400
+    w = _window(o, 30.0, 4 * days, 168, [[now, 30.0]], [(now - days, 500_000)], per_hour, monkeypatch)
+    assert w["how"] == how
+
+
+def test_when_the_use_is_elsewhere_the_token_forecast_is_ignored_even_if_higher():
+    from obol import _limits
+    now = 3600.0 * 1000
+    p = _limits.project(40, now, now + 3 * HOUR, 5 * HOUR, 100_000, [500_000] * 4, now, source="elsewhere")
+    assert p["how"] == "pace" and p["expected"] == pytest.approx(100)
+
+
+def test_hermes_and_another_app_side_by_side_counts_as_hermes():
+    from obol import _limits
+    points = [[i * 600.0, 10.0 + i * 2.0] for i in range(6)]
+    assert _limits.drives(points, lambda a, b: 50_000, 300_000, 20.0) == "hermes"
+
+
+@pytest.mark.parametrize("points,sent,tokens_in,used,want", [
+    ([[0, 40.0], [600, 40.0], [1200, 40.0]], 50_000, 100_000, 40.0, "elsewhere"),   # busy, and the percent never moved
+    ([[0, 40.0], [600, 40.0]], 100, 100_000, 40.0, None),                            # too few tokens to have shown a point
+    ([[0, 40.0], [9000, 60.0]], 50_000, 100_000, 60.0, None),                        # the only pair spans an idle gap
+    ([[0, 40.0]], 50_000, 100_000, 40.0, None),
+])
+def test_drives_needs_real_evidence(points, sent, tokens_in, used, want):
+    from obol import _limits
+    assert _limits.drives(points, lambda a, b: sent, tokens_in, used) == want
+
+
+def test_the_source_is_worked_out_once_per_reading(make, monkeypatch):
+    o = make()
+    from obol import _limits
+    calls = []
+    real = _limits.drives
+    monkeypatch.setattr(_limits, "drives", lambda *a: calls.append(1) or real(*a))
+    now = o.clock()
+    o.store.add_call(ts=now - 300, session_id="s", provider="anthropic", model="m", input_tokens=50_000, cost_usd=0, cost_status="included")
+    _window(o, 30.0, 86400, 168, [[now - 600, 28.0], [now, 30.0]], [], 100, monkeypatch)
+    o.limit_windows("anthropic")
+    o.limit_windows("anthropic")
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("text", ["sends this one message", "let this one through"])
+def test_allow_copy_says_what_it_really_does(text):
+    import pathlib
+    assert text not in (pathlib.Path(__file__).parent.parent / "_plugin.py").read_text(encoding="utf8")
+
+
+def test_stopped_turn_says_to_send_it_again(make):
+    o = make({"budget_usd": 1, "mode": "stop"})
+    feed(o, 3, 1.0)
+    out = o.pre_llm_call(session_id="s", user_message="hi", model="m")
+    assert out["action"] == "block" and "lets just your next message through (send it again after)" in out["message"]
+
+
+def _failed(o, monkeypatch, err):
+    from obol import _limits
+    monkeypatch.setattr(_limits, "read", lambda p: {"windows": [], "error": err if p == "anthropic" else "not signed in to Hermes, or the vendor didn't answer"})
+    return _commands.run(o, "")
+
+
+def test_a_broken_plan_read_is_shown_on_bare_obol(make, monkeypatch):
+    out = _failed(make(), monkeypatch, "couldn't read it (TimeoutError)")
+    assert "Claude plan limits: couldn't read it (TimeoutError)" in out and "Codex" not in out
+
+
+def test_no_login_stays_quiet_on_bare_obol(make, monkeypatch):
+    assert "plan limits:" not in _failed(make(), monkeypatch, "not signed in to Hermes, or the vendor didn't answer")
+
+
+def test_an_api_key_stays_quiet_on_bare_obol(make, monkeypatch):
+    o = make()
+    o.store.add_call(ts=o.clock() - 60, session_id="s", provider="anthropic", model="m", input_tokens=5, cost_usd=0.1, cost_status="estimated")
+    assert "plan limits:" not in _failed(o, monkeypatch, "Anthropic account limits are only available for OAuth-backed Claude accounts.")
+
+
+def test_a_silent_failure_on_the_provider_in_use_is_shown(make, monkeypatch):
+    o = make()
+    o.store.add_call(ts=o.clock() - 60, session_id="s", provider="anthropic", model="m", input_tokens=5, cost_usd=0.1, cost_status="estimated")
+    assert "Claude plan limits: not signed in" in _failed(o, monkeypatch, "not signed in to Hermes, or the vendor didn't answer")
+
+
+def test_demo_compares_against_a_meter(make):
+    out = _commands.run(make(), "demo")
+    assert "A meter that warns at 80%" in out
+    seen = out.split("Obol saw it coming ")[1].split(",")[0]
+    met = out.split("would have waited until ")[1].rstrip().split(".")[0]
+    days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+    assert (days.index(seen[:3]), seen[4:]) < (days.index(met[:3]), met[4:]), out
+
+
+def test_rules_hint_is_valid_json():
+    import json, pathlib, re
+    text = (pathlib.Path(__file__).parent.parent / "plugin.yaml").read_text(encoding="utf8")
+    hint = re.search(r"as JSON, e\.g\. (\[.*?\])\. See", text).group(1)
+    assert json.loads(hint) == [{"when": {"state": "over"}, "do": "notify"}]
+
+
+def _short_on_budget(make):
+    o = make({"budget_usd": 7, "mode": "save", "cheap_model": "c/mini"})
+    del o._hold_first_switch                # the real thing
+    feed(o, 30, 0.5)
+    return o
+
+
+def _ask(o, sid="s1"):
+    r = o.llm_request(request={"model": "big"}, provider="openrouter", session_id=sid)
+    return r["request"]["model"] if r else "big"
+
+
+def test_the_first_switch_warns_a_turn_ahead(make):
+    o = _short_on_budget(make)
+    o.pre_llm_call(session_id="s1", user_message="hi", model="big")
+    assert _ask(o) == "big" and _ask(o) == "big"            # every request of the warned turn, tool loop included
+    out = o.transform_llm_output(session_id="s1", response_text="done")
+    assert "Your next message switches from big to c/mini" in out and "switched from" not in out
+    o.pre_llm_call(session_id="s1", user_message="more", model="big")
+    assert _ask(o) == "c/mini"
+    assert "switched from big to c/mini" in o.transform_llm_output(session_id="s1", response_text="done")
+
+
+def test_only_the_first_switch_of_a_day_waits(make):
+    o = _short_on_budget(make)
+    o.pre_llm_call(session_id="s1", user_message="hi", model="big")
+    _ask(o)
+    o.pre_llm_call(session_id="s1", user_message="more", model="big")
+    assert _ask(o) == "c/mini"
+    o.pre_llm_call(session_id="s2", user_message="other", model="big")
+    assert _ask(o, "s2") == "c/mini"                        # a second session isn't held again
+
+
+
+def test_staying_switched_overnight_isnt_interrupted(make):
+    o = _short_on_budget(make)
+    o.pre_llm_call(session_id="s1", user_message="hi", model="big")
+    _ask(o)
+    o.pre_llm_call(session_id="s1", user_message="more", model="big")
+    assert _ask(o) == "c/mini"
+    o.clock_obj.t += 86400
+    o.pre_llm_call(session_id="s1", user_message="tomorrow", model="big")
+    assert _ask(o) == "c/mini"
+
+
+def test_a_new_switch_on_a_later_day_warns_again(make):
+    o = _short_on_budget(make)
+    o.pre_llm_call(session_id="s1", user_message="hi", model="big")
+    _ask(o)
+    o.pre_llm_call(session_id="s1", user_message="more", model="big")
+    assert _ask(o) == "c/mini"
+    o.cfg["budget_usd"] = 100_000                           # plenty of room: the switch is released
+    assert _ask(o) == "big"
+    o.cfg["budget_usd"] = 7
+    o.clock_obj.t += 86400
+    o.pre_llm_call(session_id="s1", user_message="tomorrow", model="big")
+    assert _ask(o) == "big"
+    assert "Your next message switches" in o.transform_llm_output(session_id="s1", response_text="done")
+
+
+def test_a_job_with_a_new_session_every_run_still_switches(make):
+    o = _short_on_budget(make)
+    o.pre_llm_call(session_id="run1", user_message="x", model="big")
+    assert _ask(o, "run1") == "big"
+    o.pre_llm_call(session_id="run2", user_message="x", model="big")
+    assert _ask(o, "run2") == "c/mini"
+
+
+def test_demo_shows_the_warning_turn(make):
+    out = _commands.run(make(), "demo")
+    assert out.index("Mon 12:00") < out.index("switches to the cheaper model")
+    assert "Mon 15:00" in out.split("switches to the cheaper model")[0]
+
+
+# ── remaining review findings ────────────────────────────────────────────────
+
+def _switched(make):
+    o = make({"budget_usd": 7, "mode": "save", "cheap_model": "c/mini"})
+    feed(o, 30, 0.5)
+    assert o.llm_request(request={"model": "big"}, provider="openrouter", session_id="s1")
+    return o
+
+
+def test_obol_says_when_you_are_switched_right_now(make):
+    assert "using c/mini now (switched from big" in _commands.run(_switched(make), "")
+
+
+def test_obol_says_when_you_are_no_longer_switched(make):
+    o = _switched(make)
+    o.cfg["mode"] = "alert"                                 # the flag is still set, but nothing steers any more
+    out = _commands.run(o, "")
+    assert "not switched now (last switch" in out and "using c/mini now" not in out
+
+
+def test_pause_means_not_switched(make):
+    o = _switched(make)
+    _commands.run(o, "pause 2h")
+    assert "not switched now" in _commands.run(o, "")
+
+
+CUSTOM = [{"when": {"state": "out"}, "do": "block"}]
+
+
+def test_custom_rules_dont_get_mode_advice(make):
+    o = make({"budget_usd": 1, "rules": CUSTOM})
+    feed(o, 3, 1.0)
+    msg = o.pre_llm_call(session_id="s", user_message="hi", model="m")["message"]
+    assert "/obol mode alert" not in msg and "`rules` setting" in msg
+    assert "won't change anything" in _commands.run(o, "mode alert")
+    assert "your own rules" in _commands.run(o, "") and "alert mode" not in _commands.run(o, "")
+
+
+def test_presets_still_get_mode_advice(make):
+    o = make({"budget_usd": 1, "mode": "stop"})
+    feed(o, 3, 1.0)
+    assert "/obol mode alert stops blocking" in o.pre_llm_call(session_id="s", user_message="hi", model="m")["message"]
+    assert "won't change anything" not in _commands.run(o, "mode stop")
+
+
+def test_cap_says_it_covers_every_session(make):
+    o = make()
+    out = _commands.run(o, "cap 2")
+    assert "across every session" in out and "Task" not in out and "task" not in out
+    assert "and always: a spending cap" in _commands.run(o, "rules")
+
+
+def test_rules_names_each_ignored_rule(make):
+    o = make({"rules": [{"when": {"state": "out"}, "do": "block"}, {"when": {}, "do": "shout"}, "nope", {"do": "note", "when": 3}, {"when": {}}]})
+    out = _commands.run(o, "rules")
+    assert 'rule 2 is ignored: "shout" isn\'t an action' in out
+    assert "rule 3 is ignored: a rule has to be" in out and "rule 4 is ignored: `when`" in out and "rule 5 is ignored: `do` is missing" in out
+
+
+def test_aux_true_is_flagged_and_aux_false_is_fine():
+    from obol import _rules
+    assert _rules.problems({"aux": True}) and not _rules.problems({"aux": False})
+
+
+class _Ctx:
+    def __init__(self, surface, ok=True):
+        self.surface, self.ok, self.sent = surface, ok, []
+
+    def session_surface(self):
+        return self.surface
+
+    def post_message(self, text):
+        self.sent.append(text)
+        return type("H", (), {"ok": self.ok})()
+
+
+@pytest.mark.parametrize("surface,ok,posted,queued", [
+    ("telegram", True, True, False), ("telegram", False, True, True), ("desktop", True, False, True), ("cli", True, False, True)])
+def test_chat_apps_get_warnings_straight_away(make, surface, ok, posted, queued):
+    o = make()
+    o.ctx = _Ctx(surface, ok)
+    o._queue_notice("s", "careful")
+    assert bool(o.ctx.sent) == posted
+    assert bool(o.store.meta("notice:s")) == queued
+    assert o.store.meta("actions")[-1]["detail"] == "careful"
+
+
+def test_old_hosts_without_posting_still_queue(make):
+    o = make()
+    o.ctx = object()
+    o._queue_notice("s", "careful")
+    assert o.store.meta("notice:s") == ["careful More: /obol why"]
+
+
+def _used_up_on(o, provider, model):
+    o.store.add_call(ts=o.clock() - 60, session_id="s1", provider=provider, model=model, input_tokens=5, cost_usd=9.0, cost_status="estimated")
+
+
+def test_model_switch_to_another_provider_isnt_held_by_the_old_budget(make):
+    o = make({"budgets": [{"provider": "anthropic", "usd": 5, "period": "week"}], "mode": "stop"})
+    _used_up_on(o, "anthropic", "claude-x")
+    assert o.pre_llm_call(session_id="s1", user_message="hi", model="claude-x")["action"] == "block"
+    assert o.pre_llm_call(session_id="s1", user_message="hi", model="gpt-5") is None
+
+
+def test_a_router_session_changing_model_keeps_its_provider(make):
+    o = make({"budgets": [{"provider": "openrouter", "usd": 5, "period": "week"}], "mode": "stop"})
+    _used_up_on(o, "openrouter", "a/b")
+    assert o.pre_llm_call(session_id="s1", user_message="hi", model="c/d")["action"] == "block"
+
+
+def test_a_model_seen_elsewhere_follows_that_provider(make):
+    o = make()
+    o.store.add_call(ts=o.clock() - 120, session_id="other", provider="openrouter", model="m2", input_tokens=5, cost_usd=0, cost_status="x")
+    o.store.add_call(ts=o.clock() - 60, session_id="s1", provider="anthropic", model="claude-x", input_tokens=5, cost_usd=0, cost_status="x")
+    assert o._turn_provider("s1", "m2") == "openrouter" and o._turn_provider("s1", "claude-x") == "anthropic"
+    assert o._turn_provider("s1", "") == "anthropic"
+
+
+def test_negative_catalogue_prices_are_unknown():
+    from obol import _pricing
+    assert _pricing.parse_catalogue([{"id": "openrouter/auto", "pricing": {"prompt": "-1", "completion": "-1"}}]) == {}
+
+
+def test_month_chart_covers_the_month(make):
+    late = make({"budget_usd": 100000, "period": "month"}, now=1_764_460_800.0)      # the 30th: a full month of actuals
+    feed(late, 690, 0.1)
+    c = late._chart(late.budget())
+    assert len(c["actual"]) <= 200 and c["actual"][0][0] == c["start"] and c["actual"][-1][0] == late.clock()
+    assert c["actual"][1][0] < c["start"] + 12 * HOUR
+
+
+def test_a_month_ahead_reaches_the_end_of_the_month(make, tmp_path):
+    early = make({"budget_usd": 100000, "period": "month"}, now=1_762_128_000.0)     # the 3rd: a full month ahead
+    feed(early, 400, 0.1)
+    c = early._chart(early.budget())
+    assert len(c["expected"]) <= 200 and c["expected"][-1][0] >= c["end"] - HOUR
+
+
+def test_thin_keeps_both_ends():
+    from obol._plugin import _thin
+    pts = [[i, i] for i in range(1000)]
+    assert len(_thin(pts)) == 200 and _thin(pts)[0] == pts[0] and _thin(pts)[-1] == pts[-1]
+    assert _thin(pts[:5]) == pts[:5]
+
+
+def test_run_out_within_the_current_hour_uses_the_time_left():
+    from obol import _budget
+    now = 3600.0 * 1000 + 3000                              # 50 minutes into the hour, 10 left
+    b = _budget.Budget(usd=10.0, period="week", provider="", mode="alert", cheap_model="")
+    f = {"start": 3600.0 * 1000, "mean": [20.0], "quantiles": {"0.5": [20.0]}, "tier": "t", "model": "m"}
+    o = _budget.outlook(b, 0.0, 0.0, f, now)
+    assert o.out_median == pytest.approx(now + 300)
+
+
+def test_moa_aggregator_isnt_metered_twice(make):
+    o = make()
+    o.meter(usage={"input_tokens": 100}, provider="openrouter", model="m", aux_task="moa_aggregator")
+    assert o.store.tokens(0, 9e12) == 0
+    o.meter(usage={"input_tokens": 100}, provider="openrouter", model="m", aux_task="title")
+    assert o.store.tokens(0, 9e12) == 100
+
+
+def test_provider_names_ignore_case(make):
+    from obol import _rules
+    o = make({"budget_usd": 0})
+    _commands.run(o, "budget 10 week OpenRouter")
+    _commands.run(o, "budget 12 week openrouter")
+    assert [e["provider"] for e in o.cfg["budgets"]] == ["openrouter"]      # one budget, not one per spelling
+    assert o.budgets()[0].provider == "openrouter"
+    o.meter(usage={"input_tokens": 5}, provider="OpenRouter", model="m")
+    assert o.store.latest_provider() == "openrouter"
+    assert _rules.matches({"provider": "OPEN*"}, {"provider": "openrouter"})
+
+
+@pytest.mark.parametrize("value,on", [(False, False), ("off", False), ("OFF", False), ("false", False), (0, False), ("on", True), (True, True), (None, True)])
+def test_plan_limits_setting_understands_yaml(make, value, on):
+    assert make({"plan_limits": value})._limits_on() is on
+
+
+def test_two_top_ups_at_once_both_count(make):
+    import threading
+    o = make({"budget_usd": 5})
+    ts = [threading.Thread(target=o.store.add_to_meta, args=("k", 1.0)) for _ in range(16)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert o.store.meta("k") == 16.0
+
+
+def test_only_one_process_claims_the_import(make):
+    o = make()
+    assert o.store.claim("c", 1000.0, 600) and not o.store.claim("c", 1100.0, 600)
+    assert o.store.claim("c", 1700.0, 600)
+    o.store.set_meta("c", 0)
+    assert o.store.claim("c", 1800.0, 600)
+
+
+def test_import_stands_aside_for_another_process(make, monkeypatch):
+    from obol import _backfill
+    o = make()
+    o.store.claim("history_claim", o.clock(), 600)
+    monkeypatch.setattr(_backfill, "import_history", lambda *a: pytest.fail("imported twice"))
+    assert o.learn_history() == {} and o.store.meta("history_imported") is None
+
+
+def test_ask_rule_key_is_per_rule(make):
+    o = make({"rules": [{"name": "big one", "when": {}, "do": "ask"}]})
+    assert o.pre_tool_call(session_id="s")["rule_key"] == "obol:big one"
+
+
+def test_ephemeris_refuses_redirects():
+    import urllib.request
+    from obol import _forecast
+    r = _forecast._NoRedirect()
+    assert r.redirect_request(None, None, 302, "x", {}, "https://elsewhere") is None
+    assert issubclass(_forecast._NoRedirect, urllib.request.HTTPRedirectHandler)
+
+
+def _locked(**kw):
+    import sqlite3
+    raise sqlite3.OperationalError("database is locked")
+
+
+@pytest.mark.parametrize("settings,blocked", [({"mode": "stop"}, True), ({"mode": "alert"}, False)])
+def test_a_locked_ledger_keeps_a_stop_in_force(make, monkeypatch, settings, blocked):
+    from obol import _plugin
+    monkeypatch.setattr(_plugin, "_obol", make(settings))
+    out = _plugin._guard(_locked)()
+    assert bool(out and out["action"] == "block") == blocked
+
+
+def test_an_ordinary_bug_doesnt_block(make, monkeypatch):
+    from obol import _plugin
+    monkeypatch.setattr(_plugin, "_obol", make({"mode": "stop"}))
+    def boom(**kw):
+        raise KeyError("x")
+    assert _plugin._guard(boom)() is None
+
+
 def test_window_lengths():
     from obol import _limits
     assert _limits.length("Current session") == 5 * HOUR and _limits.length("Current week") == 7 * 86400
@@ -778,7 +1250,7 @@ def test_snapshot_shows_the_closest_to_running_out(make, monkeypatch):
     _plan(o, monkeypatch, used=90, reset_in=HOUR)
     _plan(o, monkeypatch, used=100, reset_in=HOUR)
     s = o.desktop_snapshot()
-    assert s["state"] == "out" and s["chip"] == "Claude current session 100% · used up"
+    assert s["state"] == "out" and s["chip"] == "Claude session 100% · used up"
     assert s["chart"]["unit"] == "%" and s["chart"]["limit"] == 100 and len(s["lines"]) == 2
     assert [v for _, v in s["chart"]["actual"]] == [0.0, 90.0, 100.0, 100.0]
 
@@ -824,7 +1296,7 @@ def test_a_new_limit_reading_reaches_the_chip_without_waiting_for_another_reques
     _plan(o, monkeypatch, used=0.0, label="Current week", reset_in=3 * 86400)
     o.clock_obj.t += 600
     _plan(o, monkeypatch, used=4.0, label="Current week", reset_in=3 * 86400 - 600)
-    assert json.loads((tmp_path / "desktop.json").read_text())["chip"] == "Claude current week 4%"
+    assert json.loads((tmp_path / "desktop.json").read_text())["chip"] == "Claude week 4%"
 
 
 def _chip(tmp_path):
@@ -967,8 +1439,8 @@ def test_snapshot_gives_the_panel_a_meter_for_each_limit(make, monkeypatch):
     feed(o, 40, 0.5)
     _plan(o, monkeypatch, used=30, reset_in=2 * HOUR)
     rows = o.desktop_snapshot()["rows"]
-    assert {r["title"] for r in rows} >= {"Claude current session"} and len(rows) == 2
-    plan = next(r for r in rows if r["title"] == "Claude current session")
+    assert {r["title"] for r in rows} >= {"Claude session"} and len(rows) == 2
+    plan = next(r for r in rows if r["title"] == "Claude session")
     assert plan["used"] == 30 and plan["end"] - plan["start"] == 5 * HOUR and plan["state"] == "ok"
     budget = next(r for r in rows if r["title"] != "Claude current session")
     assert budget["amount"].startswith("$") and budget["used"] > 0
@@ -983,7 +1455,7 @@ def test_the_panel_graphs_the_week_while_the_chip_follows_the_session(make):
     o = make()
     _windows(o, ("Current session", 100.0, HOUR), ("Current week", 40.0, 3 * 86400))
     s = o.desktop_snapshot()
-    assert s["state"] == "out" and s["chip"].startswith("Claude current session 100%")
+    assert s["state"] == "out" and s["chip"].startswith("Claude session 100%")
     assert s["chart"]["title"] == "Claude current week" and s["chart"]["end"] - s["chart"]["start"] == 7 * 86400
     assert len(s["rows"]) == 2
 
@@ -1233,3 +1705,247 @@ def test_a_large_turn_is_held_on_api_keys_but_not_on_a_plan(make):
     o.store.set_meta("limits:anthropic", PLAN)
     o.store.add_call(ts=o.clock() - 60, session_id="plan", provider="anthropic", model="m", input_tokens=1)
     assert (o.pre_llm_call(session_id="plan", user_message=big, model="m") or {}).get("action") != "block"
+
+
+# ── wording that has to match what the code does ──────────────────────────────
+
+def test_a_forecast_time_is_never_to_the_minute_and_rounds_down():
+    from datetime import datetime
+    now = datetime(2026, 11, 11, 9, 0).timestamp()
+    assert _budget.around(datetime(2026, 11, 11, 15, 52, 30).timestamp(), now) == "15:45"
+    assert _budget.around(datetime(2026, 11, 13, 15, 52).timestamp(), now) == "Fri 15:00"
+    soon = datetime(2026, 11, 11, 9, 2).timestamp()      # rounding down would land in the past
+    assert _budget.around(soon, datetime(2026, 11, 11, 9, 1).timestamp()) == "09:02"
+
+
+def test_status_line_uses_the_rounded_time():
+    from datetime import datetime
+    now = datetime(2026, 11, 11, 9, 0).timestamp()
+    o = _budget.Outlook(spent=5, usd=10, start=now - 3600, end=now + 86400, end_median=30,
+                        out_median=datetime(2026, 11, 11, 15, 52).timestamp())
+    assert "~15:45" in _budget.line(o, now)
+
+
+def test_mode_help_says_when_it_acts_not_wont_last():
+    for m in ("alert", "save"):
+        assert "85%" in _budget.MODE_HELP[m]
+    assert "won't last" not in _commands.HELP
+
+
+def test_saving_a_budget_says_what_already_counts_when_it_resets_and_the_currency(make):
+    o = make({})
+    feed(o, 3, 1.0)
+    out = _commands.run(o, "budget 25 week")
+    assert "$3.00 of Hermes use this week already counts" in out
+    assert "Weeks start on Monday" in out and "US dollars at list price" in out
+    assert ", resets " in out
+    assert "already counts" not in _commands.run(make({}), "budget off")
+
+
+def test_status_gives_the_reset_of_the_period(make):
+    o = make({"budget_usd": 25, "period": "month"})
+    feed(o, 30, 0.01)
+    assert "monthly budget, resets " in _commands.run(o, "")
+
+
+def test_bare_cap_shows_it_rather_than_removing_it(make):
+    o = make({})
+    assert "No spending cap set" in _commands.run(o, "cap")
+    _commands.run(o, "cap 2")
+    assert "of $2 used" in _commands.run(o, "cap")
+    assert o.store.meta("job_cap")
+    assert _commands.run(o, "cap off") == "Spending cap removed."
+    assert _commands.run(o, "cap off") == "No spending cap was set."
+
+
+def test_cheap_off_clears_the_model_instead_of_saving_the_word_off(make):
+    o = make({"cheap_model": "c/mini", "mode": "save"})
+    _commands.run(o, "cheap off")
+    assert o.cfg["cheap_model"] == ""
+
+
+def test_cheap_says_when_save_mode_is_not_on(make):
+    assert "/obol mode save" in _commands.run(make({"mode": "alert"}), "cheap c/mini")
+    assert "/obol mode save" not in _commands.run(make({"mode": "save"}), "cheap c/mini")
+
+
+def test_pause_off_is_honest_when_nothing_was_paused(make):
+    o = make({})
+    assert _commands.run(o, "pause off") == "Obol wasn't paused."
+    _commands.run(o, "pause 1h")
+    assert _commands.run(o, "pause off") == "Obol is acting again."
+
+
+def test_a_mode_with_nothing_to_act_on_says_so(make, monkeypatch):
+    assert "no budget yet" in _commands.run(make({}), "mode stop")
+    assert "no budget yet" not in _commands.run(make({"budget_usd": 5}), "mode stop")
+    assert "no budget yet" not in _commands.run(make({}), "mode alert")
+
+
+def test_a_mode_on_a_plan_needs_no_budget(make, monkeypatch):
+    o = make({})
+    _plan(o, monkeypatch, used=10.0)
+    assert "no budget yet" not in _commands.run(o, "mode stop")
+
+
+def test_why_explains_itself_with_or_without_actions(make):
+    o = make({})
+    assert "watches how many tokens" in _commands.run(o, "why") and "hasn't had to" in _commands.run(o, "why")
+    o._log("steer", "save", "a → b")
+    out = _commands.run(o, "why")
+    assert "watches how many tokens" in out and "a → b" in out
+    assert "/obol why" in _commands.HELP
+
+
+def test_a_notice_says_where_to_find_out_more(make):
+    o = make({})
+    o._queue_notice("s", "budget alert")
+    assert "budget alert More: /obol why" in o.transform_llm_output(session_id="s", response_text="hi")
+
+
+def test_allow_says_it_is_one_message(make):
+    assert "Just that one" in _commands.run(make({}), "allow")
+
+
+def test_a_block_names_the_mode_and_puts_the_lasting_fix_before_allow(make):
+    o = make({"budget_usd": 1, "period": "day", "mode": "stop"})
+    _spent_out(o)
+    msg = o.pre_llm_call(session_id="s", user_message="hi", model="m")["message"]
+    assert "You're in stop mode" in msg and msg.index("/obol topup") < msg.index("/obol allow")
+
+
+def test_a_stopped_tool_tells_the_agent_what_to_pass_on(make):
+    o = make({"budget_usd": 1, "period": "day", "mode": "stop"})
+    _spent_out(o)
+    out = o.pre_tool_call(session_id="s", tool_name="x")
+    assert out["action"] == "block" and "stop calling tools" in out["message"]
+    assert "Pass this on to the user" in out["message"] and "/obol topup" in out["message"]
+
+
+def test_a_stopped_tool_under_a_cap_doesnt_call_it_a_budget(make):
+    o = make({})
+    feed(o, 2, 1.0)
+    o.store.set_meta("job_cap", {"usd": 0.5, "since": o.clock() - 10 * HOUR})
+    msg = o.pre_tool_call(session_id="s", tool_name="x")["message"]
+    assert "spending cap" in msg and "budget used up" not in msg and "/obol cap off" in msg
+
+
+def test_the_switch_notice_says_what_undo_does(make):
+    o = make({"budget_usd": 1, "mode": "save", "cheap_model": "c/mini"})
+    _spent_out(o)
+    assert o.llm_request(request={"model": "big"}, provider="openrouter", session_id="s")
+    note = o.transform_llm_output(session_id="s", response_text="hi")
+    assert "goes back to big and stops switching" in note
+
+
+def test_a_switch_that_cant_happen_is_told_once_a_day(make):
+    o = make({"budget_usd": 1, "mode": "save", "cheap_model": "deepseek/deepseek-v4-flash"})
+    _spent_out(o)
+    assert o.llm_request(request={"model": "claude-x"}, provider="anthropic", session_id="s") is None
+    assert "can't on anthropic" in o.transform_llm_output(session_id="s", response_text="hi")
+    assert o.llm_request(request={"model": "claude-x"}, provider="anthropic", session_id="s") is None
+    assert o.transform_llm_output(session_id="s", response_text="hi") is None
+
+
+def test_not_cheaper_is_skipped_quietly(make):
+    o = make({"budget_usd": 1, "mode": "save", "cheap_model": "c/mini",
+              "prices": {"c/mini": [5, 5], "already/cheap": [1, 1]}})
+    _spent_out(o)
+    assert o.llm_request(request={"model": "already/cheap"}, provider="openrouter", session_id="s") is None
+    assert o.transform_llm_output(session_id="s", response_text="hi") is None
+
+
+def test_a_rejected_switch_is_told_at_the_time(make):
+    o = make({"budget_usd": 1, "mode": "save", "cheap_model": "c/mini"})
+    _spent_out(o)
+    assert o.llm_request(request={"model": "big"}, provider="openrouter", session_id="s")
+    o.transform_llm_output(session_id="s", response_text="hi")
+    o.api_request_error(status_code=404, model="big", session_id="s", request={"body": {"model": "c/mini"}})
+    note = o.transform_llm_output(session_id="s", response_text="hi")
+    assert "refused c/mini (HTTP 404)" in note and "back on big" in note
+
+
+def test_a_plan_reading_says_how_old_it_is(make, monkeypatch):
+    o = make({})
+    _plan(o, monkeypatch, used=10.0, label="Current week", reset_in=3 * 86400)
+    assert " ago" not in o.limit_windows("anthropic")[0]["line"]
+    o.clock_obj.t += 40 * 60
+    w = o.limit_windows("anthropic")[0]
+    assert w["line"].endswith("· read 40m ago") and w["age"] == "40m"
+    assert " ago" not in o.desktop_snapshot()["chip"]        # the chip only says so once it's properly old
+    o.clock_obj.t += 2 * HOUR
+    assert o.desktop_snapshot()["chip"].endswith("(2h ago)")
+    assert o.desktop_snapshot()["rows"][0]["age"] == "2h"
+
+
+def test_a_window_with_no_projection_says_so(make, monkeypatch):
+    o = make({})
+    _plan(o, monkeypatch, used=0.0, label="Current week", reset_in=7 * 86400 - 60)
+    assert "no projection yet" in o.limit_windows("anthropic")[0]["line"]
+
+
+def test_a_tight_chip_says_so_in_words(make):
+    o = make({"budget_usd": 100, "period": "week"})
+    o.outlook = lambda b=None: _budget.Outlook(spent=10, usd=100, start=0, end=o.clock() + HOUR, end_median=90)
+    assert o.desktop_snapshot()["chip"].endswith(" · close")
+
+
+def test_chip_row_carries_the_basis_of_its_projection(make, monkeypatch):
+    o = make({})
+    _plan(o, monkeypatch, used=30.0, label="Current week", reset_in=3 * 86400)
+    row = o.desktop_snapshot()["rows"][0]
+    assert row["how"] == "pace" and row["title"] == "Claude week"
+
+
+def test_a_failed_history_import_is_visible(make, monkeypatch):
+    o = make({})
+    def broken(*a, **k):
+        raise OSError("locked")
+    monkeypatch.setattr(_plugin._backfill, "import_history", broken)
+    assert "couldn't read your past Hermes usage" in _commands.run(o, "")
+
+
+def test_price_list_off_never_fetches(make, monkeypatch):
+    o = make({"price_list": "off"})
+    o.prices.stale = lambda now=None: True
+    called = []
+    o.prices.refresh_async = lambda on_done=None: called.append(1)
+    o.meter(usage={"input_tokens": 1}, model="m", provider="openrouter", session_id="s")
+    assert called == []
+    o.cfg["price_list"] = "on"
+    o.meter(usage={"input_tokens": 1}, model="m", provider="openrouter", session_id="s")
+    assert called == [1]
+
+
+def test_a_failed_price_fetch_keeps_prices_and_waits_an_hour(tmp_path, monkeypatch):
+    import json, time
+    from obol import _pricing
+    p = _pricing.Prices(tmp_path)
+    (tmp_path / "prices.json").write_text(json.dumps({"fetched_at": 0, "rates": {"m": [1, 2, 3, 4]}}))
+    assert p.stale(time.time())
+    p._note_failure()
+    assert not p.stale(time.time()) and p.stale(time.time() + 3700)
+    assert json.loads((tmp_path / "prices.json").read_text())["rates"]["m"] == [1, 2, 3, 4]
+
+
+def test_an_empty_price_list_counts_as_a_failure(tmp_path, monkeypatch):
+    import io, json, time
+    from obol import _pricing
+    (tmp_path / "prices.json").write_text(json.dumps({"fetched_at": 0, "rates": {"m": [1, 2, 3, 4]}}))
+    monkeypatch.setattr(_pricing.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(b'{"data": []}'))
+    p = _pricing.Prices(tmp_path)
+    done = []
+    p.refresh_async(on_done=lambda: done.append(1))
+    for _ in range(200):
+        if not p._fetching:
+            break
+        time.sleep(0.01)
+    assert not done and p.rate("m") == (1, 2, 3, 4)
+    assert p.stale(time.time() + 3700)          # retried in an hour, not trusted for a day
+
+
+def test_the_demo_names_its_forecaster_and_the_chip(make):
+    o = make({})
+    out = _commands.run(o, "demo")
+    assert "from the usage so far" not in out and "on this machine" in out
+    assert "the chip in the status bar" in out

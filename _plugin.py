@@ -12,6 +12,7 @@ import ipaddress
 import json
 import logging
 import math
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ from . import _backfill, _budget, _forecast, _limits, _rules
 from ._pricing import Prices
 from ._store import HOUR, Store
 
+CLAIM_FOR = 600                 # a history import that hasn't finished in this long has died
 DEMO_FOR = 300                  # how long /obol demo's chart stays on the chip
 CHIP_EVERY = 30                 # rewrite the chip this often, so it stays right with no requests arriving
 CHIP_FIRST = 5                  # wait this long after loading: short-lived Hermes commands load plugins too
@@ -35,6 +37,7 @@ STEER_PAUSE = 6 * HOUR           # after the provider rejects the cheap model
 STEER_RELEASE = 0.60             # once switched, stay until the expected total is this far under the budget
 LIMITS_EVERY = 5 * 60            # at most one read of a provider's plan limits this often
 LIMITS_STALE = HOUR              # older than this, a reading is shown but not acted on
+LIMITS_AGED = 15 * 60            # older than this, a reading says how old it is
 ALLOW_FOR = HOUR                 # /obol allow: how long it waits for a turn, and how long that turn's tools run
 # Providers that serve only their own models. Routers (OpenRouter and the like) can serve anything.
 WEEK = 7 * 24 * HOUR
@@ -59,6 +62,7 @@ class Obol:
         self._lock = threading.Lock()
         self._refreshing = False
         self._reading = set()
+        self._sources = {}
         self._saved_only = threading.local()
 
     # opened on first use, not in register(): the plugin probe has no profile data directory
@@ -83,11 +87,14 @@ class Obol:
         with self._lock:
             if self.store.meta("history_imported") is not None:
                 return self.store.meta("history_imported")
+            if not self.store.claim("history_claim", self.clock(), CLAIM_FOR):
+                return {}                         # another Hermes process is importing it right now
             try:
                 got = _backfill.import_history(self.store, self.data_dir, self.prices.cost, self.clock())
             except Exception as e:                # a locked state.db, say: try again later, not on every hook
                 log.warning("obol: couldn't read past usage: %s", e)
                 self.store.set_meta("history_failed_at", self.clock())
+                self.store.set_meta("history_claim", 0)
                 return {}
             self.store.set_meta("history_imported", got or {"sessions": 0})
             return got
@@ -100,7 +107,8 @@ class Obol:
 
     # ── settings ─────────────────────────────────────────────────────────────
     def budget(self) -> _budget.Budget:
-        return _budget.Budget.from_config(self._get)
+        b = _budget.Budget.from_config(self._get)
+        return dataclasses.replace(b, provider=b.provider.lower()) if b.provider else b
 
     def budgets(self) -> list:
         """Every active budget: the main one (all providers, or the one named in `provider`) plus one per entry in
@@ -113,7 +121,7 @@ class Obol:
             usd = _budget.number(e.get("usd"))
             period = e.get("period") if e.get("period") in _budget.PERIODS else "week"
             if usd > 0:
-                out.append(dataclasses.replace(main, usd=usd, period=period, provider=str(e["provider"])))
+                out.append(dataclasses.replace(main, usd=usd, period=period, provider=str(e["provider"]).lower()))
         return out
 
     def set_provider_budget(self, provider: str, usd: float, period: str) -> None:
@@ -132,7 +140,7 @@ class Obol:
             return None
         start, _ = _budget.period_bounds(b.period, self.clock())
         key = f"topup:{b.provider or '*'}:{b.period}:{int(start)}"
-        self.store.set_meta(key, float(self.store.meta(key) or 0) + amount)
+        self.store.add_to_meta(key, amount)
         self._log("top-up", "you", f"+${amount:g} this {b.period}" + (f" on {provider}" if provider else ""))
         return b
 
@@ -143,11 +151,11 @@ class Obol:
     def meter(self, **kw):
         """post_api_request / post_auxiliary_call: record tokens and cost. Never raises, never blocks on network."""
         usage = kw.get("usage")
-        if not isinstance(usage, dict):
-            return
+        if not isinstance(usage, dict) or kw.get("aux_task") == "moa_aggregator":
+            return                  # Hermes reports an aggregator's usage on the main request too (agent/aux_accounting.py)
         self.learn_history()      # before the first row, so history ends where Obol's own data begins
         model = kw.get("response_model") or kw.get("model") or ""
-        provider = kw.get("provider") or ""
+        provider = (kw.get("provider") or "").lower()
         if provider in ("", "auto"):        # background calls can report "auto": charge them to the real provider
             provider = self.store.last_provider(kw.get("session_id") or "") or self.store.latest_provider() or provider
         try:
@@ -160,7 +168,7 @@ class Obol:
         except Exception:                   # the request still happened: record it, unpriced
             log.warning("obol: couldn't price %s", model, exc_info=True)
             cost, status = None, "unpriced"
-        if self.prices.stale(self.clock()):
+        if self._on("price_list") and self.prices.stale(self.clock()):
             def repriced():
                 self.store.reprice(self.prices.cost)
                 self.redraw_desktop()
@@ -215,11 +223,10 @@ class Obol:
                 continue
             total += max(0.0, v - self.store.spent(current, now, b.provider)) if h == current else v
             expected.append([min(h + HOUR, o.end), round(total, 4)])
-        expected = expected[:200]
         past = self.store.hourly(until=now, provider=b.provider)
         return {"title": self.label(b), "unit": "$", "start": o.start, "end": o.end, "limit": o.usd,
-                "actual": actual[-200:], "expected": expected, "out_at": o.out_median,
-                **_forecast.band(expected, _forecast.spread(past, now, o.end))}
+                "actual": _thin(actual), "expected": _thin(expected), "out_at": o.out_median,
+                **_forecast.band(_thin(expected), _forecast.spread(past, now, o.end))}
 
     def _window_chart(self, w: dict) -> dict | None:
         """A plan window in percent: the readings so far, then where it's heading."""
@@ -273,11 +280,13 @@ class Obol:
             for w in self.limit_windows(p, with_path=True):
                 how = {"forecast": "your token history", "pace": "your pace so far"}.get(w["how"], "")
                 size = _limits.length(w["label"])
+                short = w["name"].replace(" current ", " ")     # the vendor's label: "Claude current week"
                 meter = None if not size or not w.get("reset_at") else {
-                    "title": w["name"], "used": w["used"], "expected": w["expected"], "start": w["reset_at"] - size,
-                    "end": w["reset_at"], "out_at": w["out_at"]}
+                    "title": short, "used": w["used"], "expected": w["expected"], "start": w["reset_at"] - size,
+                    "end": w["reset_at"], "out_at": w["out_at"], "how": w["how"], "age": w["age"]}
+                old = f" ({w['age']} ago)" if w["read_age"] > LIMITS_STALE else ""
                 rows.append({"state": w["state"], "out": w["out_at"], "budget": None, "line": w["line"], "window": w,
-                             "chip": f"{w['name']} {w['used']:.0f}%", "model": how, "meter": meter})
+                             "chip": f"{short} {w['used']:.0f}%{old}", "model": how, "meter": meter})
         rows.sort(key=lambda r: (_rules.SEVERITY.get(r["state"], 0), -(r["out"] or float("inf"))), reverse=True)
         if not rows:
             u = self.unbudgeted()
@@ -290,7 +299,9 @@ class Obol:
         if top["state"] == "out":
             chip += " · used up"
         elif top["out"] and top["state"] == "over":
-            chip += f" · out ~{when(top['out'], now)}"
+            chip += f" · out ~{_budget.around(top['out'], now)}"
+        elif top["state"] == "tight":
+            chip += " · close"             # not only a colour
         return {"state": top["state"], "chip": chip, "at": now, "lines": [r["line"] for r in rows[:4]],
                 "rows": [dict(r["meter"], state=r["state"]) for r in rows[:4] if r["meter"]],
                 "forecast": charted["model"] or top["model"] or "",
@@ -339,8 +350,12 @@ class Obol:
         # Same context as register(), so a background tick resolves the same profile directory.
         threading.Thread(target=contextvars.copy_context().run, args=(run,), name="obol-chip", daemon=True).start()
 
+    def _on(self, key: str) -> bool:
+        value = self._get(key, "on")                # YAML reads a bare `off` as False
+        return value is not False and value != 0 and str(value).lower() not in ("off", "false", "no")
+
     def _limits_on(self) -> bool:
-        return str(self._get("plan_limits", "on") or "on") != "off"
+        return self._on("plan_limits")
 
     def read_limits(self, provider: str) -> dict:
         """Read now, through Hermes's own login. A failed read keeps the last good one, and says so."""
@@ -428,6 +443,8 @@ class Obol:
         name = _limits.NAMES.get(provider, provider)
         path = None
         rows = []
+        read_age = now - (rec.get("read_at") or now)
+        age = _budget.ago(read_age) if read_age > LIMITS_AGED else ""
         for w in rec["windows"]:
             reset, used = w.get("reset_at"), float(w["used"])
             if reset and reset <= now:                 # it has reset since the last reading
@@ -437,28 +454,43 @@ class Obol:
             if tokens_in >= _limits.MIN_TOKENS and path is None:
                 path = self._token_path(provider) or {}
             hour = self.store.tokens(int(now // HOUR) * HOUR, now, provider)
-            p = _limits.project(used, now, reset, size, tokens_in, (path or {}).get("mean"), (path or {}).get("start"), hour)
+            source = self._window_source(provider, w["label"], rec, tokens_in, used)
+            p = _limits.project(used, now, reset, size, tokens_in, (path or {}).get("mean"), (path or {}).get("start"), hour, source)
             st = _limits.state(used, p["expected"])
             line = p.pop("path")
             if with_path:
                 p["path"] = line
-            rows.append(dict(w, provider=provider, name=f"{name} {w['label'].lower()}", state=st, **p,
-                             line=self._window_line(name, w["label"], used, reset, p, st, now)))
+            rows.append(dict(w, provider=provider, name=f"{name} {w['label'].lower()}", state=st, **p, age=age, read_age=read_age,
+                             line=self._window_line(name, w["label"], used, reset, p, st, now)
+                             + (f" · read {age} ago" if age else "")))
         return _limits.worst_first(rows)
+
+    def _window_source(self, provider, label, rec, tokens_in, used):
+        """Whether Hermes is what's filling this window. Worked out once per reading: the hooks ask on every call."""
+        points = ((rec.get("log") or {}).get(label) or {}).get("points") or []
+        if tokens_in < _limits.MIN_TOKENS or len(points) < 2:
+            return None
+        key, cached = (provider, label), self._sources.get((provider, label))
+        if cached and cached[0] == points[-1][0]:
+            return cached[1]
+        found = _limits.drives(points, lambda a, b: self.store.tokens(a, b, provider), tokens_in, used)
+        self._sources[key] = (points[-1][0], found)
+        return found
 
     @staticmethod
     def _window_line(name, label, used, reset, p, st, now) -> str:
-        when = _budget._when
+        when, around = _budget._when, _budget.around
+        how = " (at your pace so far)" if p["how"] == "pace" else ""
         head = f"{name} {label.lower()}: {used:.0f}% used"
         until = f"resets {when(reset, now)}" if reset else "reset time unknown"
         if st == "out":
             return f"{head} · limit reached, {until}"
         if st == "over" and p["out_at"]:
-            return f"{head} · ⚠ on track to hit the limit ~{when(p['out_at'], now)}, before it {until}"
+            return f"{head} · ⚠ on track to hit the limit ~{around(p['out_at'], now)}, before it {until}{how}"
         if p["expected"] is None:
-            return f"{head} · {until}"
+            return f"{head} · no projection yet, {until}"
         prefix = "close: " if st == "tight" else ""
-        return f"{head} · {prefix}on track for {p['expected']:.0f}% before it {until}"
+        return f"{head} · {prefix}on track for {p['expected']:.0f}% before it {until}{how}"
 
     # ── forecast ─────────────────────────────────────────────────────────────
     def forecast(self, b: _budget.Budget | None = None) -> dict | None:
@@ -614,7 +646,7 @@ class Obol:
         now = self.clock()
         b = self.budget()
         if provider is None:                # a session's first turn has no rows: go by the model it's about to use
-            provider = self.store.last_provider(session_id) or self.store.provider_of_model(model)
+            provider = self._turn_provider(session_id, model)
         if self.on_plan(provider):          # nobody is billed for this turn, so a dollar hold doesn't apply
             request_usd = None
         ctx = {"provider": provider, "model": model, "platform": platform, "aux": aux, "request_usd": request_usd,
@@ -657,12 +689,36 @@ class Obol:
                 ctx["state"] = "out"
                 ctx["task_cap_hit"] = True
                 ctx["limit"] = None
-                ctx["line"] = f"task cap ${job['usd']:g} used up (${used:.2f} since it was set)"
+                ctx["line"] = f"spending cap ${job['usd']:g} used up (${used:.2f} since it was set)"
         usual = self._usual_day(b.provider, now)
         if usual:
             today = self._today_expected(b.provider, self.forecast(b), now)
             ctx.update(day_vs_usual=today / usual, today_expected=today, usual_day=usual)
         return ctx
+
+    def _turn_provider(self, sid: str, model: str) -> str:
+        """The provider this turn will use. Hermes doesn't say, so go by what the session last used, unless `/model`
+        has since moved it: a used-up budget on the old provider mustn't hold a session that has left it."""
+        last = self.store.last_provider(sid)
+        if not model:
+            return last
+        if not last or self.store.has_served(last, model):
+            return last or self.store.provider_of_model(model)
+        seen = self.store.provider_of_model(model)
+        if seen:
+            return seen
+        own = OWN_MODELS.get(last.lower())
+        return "" if own and not model.rsplit("/", 1)[-1].lower().startswith(own) else last
+
+    def _way_out(self, what: str, back_to: str = "") -> str:
+        """The mode only governs what happens when you haven't written your own rules."""
+        if self._get("rules", []):
+            return f"Your `rules` setting is what's {what}."
+        then = f"goes back to {back_to} and stops {what}" if back_to else f"stops {what}"
+        return f"You're in {self.budget().mode} mode. /obol mode alert {then}."
+
+    def stops_anything(self) -> bool:
+        return any("block" in r["do"] for r in self.rules())
 
     def rules(self) -> list:
         raw = self._get("rules", []) or []
@@ -689,15 +745,16 @@ class Obol:
         at = self.store.meta(f"allowed_turn:{sid}")
         return bool(at) and self.clock() - at < ALLOW_FOR
 
-    def _can_steer(self, target: str, current: str, provider: str) -> bool:
-        """Only to a model this provider is known to serve, and only if it's cheaper (when both prices are known).
-        A provider Obol doesn't recognise is never steered: it may be a private endpoint the person chose on purpose."""
+    @staticmethod
+    def _serves(target: str, provider: str) -> bool:
+        """A provider Obol doesn't recognise is never steered: it may be a private endpoint the person chose on purpose."""
         name = (provider or "").lower()
         own = OWN_MODELS.get(name)
-        if own:
-            if not target.rsplit("/", 1)[-1].lower().startswith(own):
-                return False
-        elif name not in ROUTERS:
+        return target.rsplit("/", 1)[-1].lower().startswith(own) if own else name in ROUTERS
+
+    def _can_steer(self, target: str, current: str, provider: str) -> bool:
+        """Only to a model this provider is known to serve, and only if it's cheaper (when both prices are known)."""
+        if not self._serves(target, provider):
             return False
         new, old = self.prices.rate(target), self.prices.rate(current)
         return not (new and old and new[0] >= old[0] and new[1] >= old[1])
@@ -714,6 +771,8 @@ class Obol:
             return None
         sid = kw.get("session_id") or ""
         self.store.set_meta(f"allowed_turn:{sid}", None)    # runs once per turn: last turn's allowance is over
+        if (held := self.store.meta("steer_held")) and not held["ready"]:
+            self.store.set_meta("steer_held", dict(held, ready=True))   # the warned turn is over: this one may switch
         # The hook sees the conversation but not the system prompt or tool definitions, so start from the size
         # of the last real request (which includes them) plus the new message.
         new_msg = self._tokens([kw.get("user_message") or ""])
@@ -741,7 +800,7 @@ class Obol:
                    if ctx.get("request_usd") is not None and "request_usd" in r["when"] else ctx["line"])
             self._log("ask", r["name"], why)
             return {"action": "block", "message": f"Obol: {v if isinstance(v, str) else 'check first'}: {why}. "
-                                                  "Send /obol allow to let this one through."}
+                                                  "Send /obol allow, then send your message again."}
         notes, steer_to = [], None
         for r, action, v in acts:
             key = f"{r['name']}:{ctx['state']}:{ctx.get('budget_provider', '')}"
@@ -761,26 +820,26 @@ class Obol:
                     self.store.set_meta(f"notified:{key}:{stamp}", self.clock())
                     self._queue_notice(sid, v if isinstance(v, str) else self._notice_text(r, ctx))
         if notes and steer_to and self._can_steer(steer_to, kw.get("model") or "", ctx["provider"]):
-            notes.append(f"Requests are being routed to {steer_to} to stretch the budget.")
+            notes.append(f"Requests may be routed to {steer_to} to stretch the budget.")
         return {"context": " ".join(notes)} if notes else None
 
     def _stopped(self, ctx) -> str:
         """What a stopped turn tells the person: what happened, when it ends, and every way out."""
         lim = ctx.get("limit")
         if not lim:
-            return (f"Obol: {ctx['line'] or 'stopped by your rule'}. /obol cap off removes the cap, /obol allow sends "
-                    "this one message, /obol pause 1h stops Obol acting for a while.")
+            return (f"Obol: {ctx['line'] or 'stopped by your rule'}. /obol cap off removes the cap, /obol pause 1h stops "
+                    "Obol acting for a while, and /obol allow lets just your next message through (send it again after).")
         if lim.get("window"):
-            return (f"Obol: {ctx['line']}. /obol allow sends this one message, /obol mode alert stops blocking. "
-                    "A plan limit can't be topped up from here.")
+            return (f"Obol: {ctx['line']}. {self._way_out('blocking')} /obol allow lets just your next message through "
+                    "(send it again after). A plan limit can't be topped up from here.")
         name = f"{_budget.ADJ[lim['period']]} {lim['provider'] + ' ' if lim['provider'] else ''}limit"
         over = lim["spent"] - lim["usd"]
         need = math.ceil(max(over, 0)) + max(1, math.ceil(lim["usd"] * 0.25))
         scope = f" {lim['provider']}" if lim["provider"] else ""
         return (f"Obol: budget used up. You've spent {_budget._money(lim['spent'])} of your "
                 f"{_budget._money(lim['usd'])} {name}; it resets {_budget._when(lim['end'], self.clock())}. "
-                f"/obol topup {need}{scope} raises it, /obol allow sends this one message, "
-                "/obol mode alert stops blocking.")
+                f"/obol topup {need}{scope} raises it. {self._way_out('blocking')} /obol allow lets just your next "
+                "message through (send it again after).")
 
     def _notice_text(self, rule, ctx) -> str:
         if "day_vs_usual" in rule["when"] and ctx.get("day_vs_usual"):
@@ -788,9 +847,33 @@ class Obol:
                     f"day (${ctx['usual_day']:.2f}).")
         return ctx["line"] or "budget alert"
 
+    def _post_now(self, text) -> bool:
+        """Chat apps only show a reply once it's finished, which can be long after a warning matters. Where the host
+        can post into the conversation, do that; the terminal and Desktop keep the line under the reply."""
+        post, surface = getattr(self.ctx, "post_message", None), getattr(self.ctx, "session_surface", None)
+        if not post or not surface:
+            return False
+        try:
+            if (surface() or "cli") in ("cli", "tui", "desktop", "acp"):
+                return False
+            return bool(post(f"⚠ Obol: {text}").ok)
+        except Exception:
+            log.debug("obol: couldn't post a notice", exc_info=True)
+            return False
+
+    def _tell_once(self, key, sid, text) -> None:
+        """Once a day per `key`: the same news on every request would be noise."""
+        mark = f"notified:{key}:{int(_budget.period_bounds('day', self.clock())[0])}"
+        if self.store.meta(mark) is None:
+            self.store.set_meta(mark, self.clock())
+            self._queue_notice(sid, text)
+
     def _queue_notice(self, sid, text) -> None:
+        if self._post_now(f"{text} More: /obol why"):
+            self._log("notify", "alert", text)
+            return
         pending = self.store.meta(f"notice:{sid}") or []
-        pending.append(text)
+        pending.append(f"{text} More: /obol why")
         self.store.set_meta(f"notice:{sid}", pending[-3:])
         self._log("notify", "alert", text)
 
@@ -818,10 +901,10 @@ class Obol:
         r, action, v = next((a for a in acts if a[1] == "block"), acts[0])
         if action == "block":
             self._log("block tool", r["name"], ctx["line"])
-            return {"action": "block", "message": "Obol: budget used up; stop calling tools, summarise what is "
-                                                  "done so far and what is left, then end the turn."}
+            return {"action": "block", "message": "Obol: stop calling tools, summarise what is done so far and what is left, "
+                                                  f"then end the turn. Pass this on to the user: {self._stopped(ctx)}"}
         self._log("ask tool", r["name"], ctx["line"])
-        return {"action": "approve", "rule_key": "obol",
+        return {"action": "approve", "rule_key": f"obol:{r['name']}",
                 "message": f"Obol: {v if isinstance(v, str) else ctx['line'] or 'budget check'}. Run this tool anyway?"}
 
     def llm_request(self, **kw):
@@ -848,7 +931,14 @@ class Obol:
             if action == "steer":
                 target, rule = _rules.steer_target(v, seen["state"]), r
                 break
-        if not target or not self._can_steer(target, req.get("model"), ctx["provider"]):
+        if not target:
+            return None
+        if not self._can_steer(target, req.get("model"), ctx["provider"]):
+            if not self._serves(target, ctx["provider"]):       # not cheaper is fine to skip quietly; this isn't
+                where = ctx["provider"] or "this provider"
+                self._tell_once(f"steer_refused:{target}:{where}", kw.get("session_id") or "",
+                                f"wanted to switch to {target}, but can't on {where}, so you're staying on {req.get('model')}. "
+                                "Pick a model it serves with /obol cheap <model>.")
             return None
         target = self._model_id_for(target, ctx["provider"])
         if target == req.get("model"):
@@ -856,6 +946,9 @@ class Obol:
         bad = self.store.meta("steer_failed")
         if (bad and bad.get("model") == target and bad.get("provider", "") in ("", ctx["provider"])
                 and self.clock() - bad["at"] < STEER_PAUSE):
+            return None
+        already = bool(steering and self.store.meta(steering))     # switched and staying switched: nothing new to warn about
+        if not already and self._hold_first_switch(kw.get("session_id") or "", req.get("model"), target, ctx):
             return None
         if steering:
             self.store.set_meta(steering, self.clock())
@@ -866,13 +959,22 @@ class Obol:
         if (self.store.meta("last_steer_logged") or "") != f"{req.get('model')}>{target}":
             self.store.set_meta("last_steer_logged", f"{req.get('model')}>{target}")
             self._log("steer", rule["name"], f"{req.get('model')} → {target} ({ctx['line']})")
-        day = int(_budget.period_bounds("day", self.clock())[0])
-        told = f"notified:steer:{req.get('model')}>{target}:{day}"
-        if self.store.meta(told) is None:             # answers are about to change: the person should know why
-            self.store.set_meta(told, self.clock())
-            self._queue_notice(kw.get("session_id") or "", f"switched from {req.get('model')} to {target} to stretch "
-                               f"the budget ({ctx['line']}). /obol mode alert stops switching.")
+        self._tell_once(f"steer:{req.get('model')}>{target}", kw.get("session_id") or "",   # answers are changing: say why
+                        f"switched from {req.get('model')} to {target} to stretch the budget ({ctx['line']}). "
+                        f"{self._way_out('switching', back_to=req.get('model'))}")
         return {"request": new, "source": "obol", "reason": f"rule '{rule['name']}': {ctx['line']}"}
+
+    def _hold_first_switch(self, sid, current, target, ctx) -> bool:
+        """The first switch of a day waits one turn, so the person hears about it before answers change. It's one record
+        for all sessions, not one each: a job that starts a new session every run would otherwise never switch."""
+        pair, day = f"{current}>{target}", int(_budget.period_bounds("day", self.clock())[0])
+        held = self.store.meta("steer_held")
+        if held and held["pair"] == pair and held["day"] == day:
+            return not held["ready"]
+        self.store.set_meta("steer_held", {"pair": pair, "day": day, "ready": False})
+        self._queue_notice(sid, f"{ctx['line']}. Your next message switches from {current} to {target} to stretch the "
+                                f"budget. {self._way_out('switching')}")
+        return True
 
     def api_request_error(self, **kw):
         """If the provider rejects the cheap model right after a steer (not allowed, not found), stop steering
@@ -894,7 +996,18 @@ class Obol:
             self.store.set_meta("steer_failed", {"model": steer["to"], "at": self.clock(), "error": msg,
                                                 "provider": steer.get("provider", "")})
             log.warning("obol: provider rejected cheap model %s; steering paused", steer["to"])
+            self._tell_once(f"steer_rejected:{steer['to']}", kw.get("session_id") or "",
+                            f"{steer.get('provider') or 'the provider'} refused {steer['to']} ({msg}), so you're back on "
+                            f"{steer.get('from')} and Obol won't try it for 6 hours. /obol cheap <model> picks another.")
         return None
+
+    def _switched_now(self, rows, windows) -> bool:
+        """Whether requests are going to the cheaper model right now, not just whether they ever have."""
+        if self._paused() or not any("steer" in r["do"] for r in self.rules()):
+            return False
+        keys = [f"{b.provider or '*'}:{int(o.end)}" for b, o in rows]
+        keys += [f"{w['provider']}:{int(w['reset_at'])}" for w in windows if w.get("reset_at")]
+        return any(self.store.meta(f"steering:{k}") for k in keys)
 
     def what_if(self, b=None) -> dict | None:
         """If the rest of this period went to the cheaper model: your last week's token mix priced on it scales the
@@ -919,7 +1032,7 @@ class Obol:
         limit = dataclasses.replace(b, usd=o.usd)
         new = _budget.outlook(limit, o.spent, self.store.spent(int(now // HOUR) * HOUR, now, b.provider), scaled, now)
         if new.out_median:
-            text = f"it would run out ~{_budget._when(new.out_median, now)} instead"
+            text = f"it would run out ~{_budget.around(new.out_median, now)} instead"
         else:
             text = f"it would finish around {_budget._money(new.end_median)} {_budget._by_end(o)}, inside {_budget._money(o.usd)}"
         return {"model": target, "expected": new.end_median, "runs_out_at": new.out_median, "text": text}
@@ -987,6 +1100,8 @@ class Obol:
         out["ephemeris_key"] = bool(self._secret(SECRET))
         if learned and learned.get("sessions"):
             out["learned"] = learned
+        if self.store.meta("history_imported") is None and self.store.meta("history_failed_at"):
+            out["history_failed"] = True
         f = self.store.meta(f"forecast:{b.provider or '*'}:{b.period}") or {}
         if f.get("note"):
             out["forecaster_note"] = f["note"]
@@ -998,6 +1113,7 @@ class Obol:
             out["steer_paused"] = bad
         if steer := self.store.meta("last_steer"):
             out["last_steer"] = steer
+            out["switched_now"] = self._switched_now(rows, out["limits"])
         return out
 
 
@@ -1016,10 +1132,38 @@ def _read_secret(name: str) -> str | None:
 _obol: Obol | None = None
 
 
+def _thin(points: list, most: int = 200) -> list:
+    """At most `most` evenly spaced points, always keeping both ends, so a month's chart still covers the month."""
+    if len(points) <= most:
+        return points
+    step = (len(points) - 1) / (most - 1)
+    return [points[round(i * step)] for i in range(most)]
+
+
 def _safe(fn):
     def wrapped(**kw):
         try:
             return fn(**kw)
+        except Exception:
+            log.warning("obol: %s failed", fn.__name__, exc_info=True)
+            return None
+    wrapped.__name__ = fn.__name__
+    return wrapped
+
+
+def _guard(fn):
+    """Like _safe for the hooks that stop spending. If the ledger can't be read, a limit can't be confirmed, so anyone
+    with a stop in force stays stopped. Any other failure is Obol's own bug, and that shouldn't take the agent down."""
+    def wrapped(**kw):
+        try:
+            return fn(**kw)
+        except sqlite3.OperationalError:
+            log.warning("obol: %s couldn't read the ledger", fn.__name__, exc_info=True)
+            if _obol is not None and _obol.stops_anything():
+                return {"action": "block", "message": "Obol: couldn't read its spend ledger, so it can't confirm you're under "
+                                                      "your limit. Try again in a moment. If this keeps happening: "
+                                                      "hermes plugins disable obol"}
+            return None
         except Exception:
             log.warning("obol: %s failed", fn.__name__, exc_info=True)
             return None
@@ -1034,8 +1178,8 @@ def register(ctx):
     from . import _commands
     for hook in ("post_api_request", "post_auxiliary_call"):
         ctx.register_hook(hook, _safe(_obol.meter))
-    ctx.register_hook("pre_llm_call", _safe(_obol.pre_llm_call))
-    ctx.register_hook("pre_tool_call", _safe(_obol.pre_tool_call))
+    ctx.register_hook("pre_llm_call", _guard(_obol.pre_llm_call))
+    ctx.register_hook("pre_tool_call", _guard(_obol.pre_tool_call))
     ctx.register_hook("api_request_error", _safe(_obol.api_request_error))
     ctx.register_hook("transform_llm_output", _safe(_obol.transform_llm_output))
     ctx.register_middleware("llm_request", _safe(_obol.llm_request))

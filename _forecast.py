@@ -127,6 +127,12 @@ def cascade(hours, horizon, data_dir: Path = None, tokens=None, usd_per_token=No
 EPHEMERIS_API = "https://ephemeris.cascade.industries/api/v1"
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib would carry the Authorization header to wherever a redirect points. The API never needs one."""
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
 def ephemeris(hours, horizon, key: str, model: str = "toto2-313m", timeout: float = 60):
     """One paid call. Sends only the hourly dollar totals: no prompts, models, sessions or names.
     No automatic retries; the Idempotency-Key is chosen before submission."""
@@ -137,7 +143,7 @@ def ephemeris(hours, horizon, key: str, model: str = "toto2-313m", timeout: floa
                                  headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
                                           "Idempotency-Key": f"obol-{uuid.uuid4()}",
                                           "User-Agent": "hermes-obol"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as r:
         got = json.load(r)
     qs = got["forecasts"][0]["quantiles"]
     def path(lv):

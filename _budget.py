@@ -17,9 +17,9 @@ HOUR = 3600
 TIGHT = 0.85
 MODES = ("alert", "save", "stop")
 LEGACY = {"watch": "alert", "steer": "save", "guard": "stop"}
-MODE_HELP = {"alert": "tells you and the agent when the budget won't last",
-             "save": "also switches to a cheaper model when the budget won't last",
-             "stop": "also stops new turns once the budget is used up"}
+MODE_HELP = {"alert": "tells you and the agent once the forecast reaches 85% of the limit",
+             "save": "also switches to a cheaper model once the forecast reaches 85% of the limit",
+             "stop": "also stops the agent once the budget is used up"}
 PERIODS = ("day", "week", "month")
 ADJ = {"day": "daily", "week": "weekly", "month": "monthly"}
 
@@ -118,7 +118,7 @@ def outlook(budget: Budget, spent: float, spent_this_hour: float, forecast: dict
         before = total
         total += v
         if crossed is None and total >= budget.usd > before and v > 0:
-            crossed = max(now, h) + HOUR * (budget.usd - before) / v
+            crossed = max(now, h) + (min(h + HOUR, end) - max(now, h)) * (budget.usd - before) / v
     o.end_median, o.out_median = total, crossed
     return o
 
@@ -128,6 +128,20 @@ def _when(ts: float, now: float) -> str:
     if ts - now < 20 * HOUR:
         return dt.strftime("%H:%M")
     return dt.strftime("%a %H:%M")
+
+
+def around(ts: float, now: float) -> str:
+    """When a forecast says something happens. It's rough, so never to the minute: rounded down to the quarter hour
+    today and the hour further out. Down, so a warning is early rather than late and can't land after a reset."""
+    near = ts - now < 20 * HOUR
+    dt = datetime.fromtimestamp(ts)
+    down = dt.replace(minute=dt.minute - dt.minute % 15 if near else 0, second=0, microsecond=0).timestamp()
+    return _when(down if down >= now else ts, now)
+
+
+def ago(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    return f"{minutes}m" if minutes < 60 else f"{minutes // 60}h" if minutes < 1440 else f"{minutes // 1440}d"
 
 
 def _money(x: float) -> str:
@@ -154,7 +168,7 @@ def line(o: Outlook, now: float | None = None) -> str:
     if st == "unknown":
         return f"{head} · too early to forecast (under a day of use)"
     if st == "over":
-        tail = f"on track to run out ~{_when(o.out_median, now)}" if o.out_median else "on track to run out"
+        tail = f"on track to run out ~{around(o.out_median, now)}" if o.out_median else "on track to run out"
         return f"{head} · ⚠ {tail}"
     if st == "tight":
         return f"{head} · close: on track for {_money(o.end_median)} {_by_end(o)}"

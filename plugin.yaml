@@ -39,7 +39,7 @@ config_schema:
     choices: [alert, save, stop]
     default: alert
     label: "When I'm about to run out"
-    description: "alert: warn me · save: also switch to the cheaper model below · stop: also refuse new messages once the budget is used up"
+    description: "alert: warn me once the forecast reaches 85% of the limit · save: also switch to the cheaper model below at that point · stop: also refuse new messages once the budget is used up"
   cheap_model:
     type: str
     default: ""
@@ -75,13 +75,13 @@ config_schema:
     type: list
     default: []
     label: "Advanced · your own rules"
-    description: "Replace the mode with your own rules, e.g. [{when: {state: over}, do: notify}]. See the README and /obol rules"
+    description: 'Replace the mode with your own rules, as JSON, e.g. [{"when": {"state": "over"}, "do": "notify"}]. See the README and /obol rules'
   forecaster:
     type: str
     choices: [auto, cascade, ephemeris, seasonal]
     default: auto
     label: "Advanced · forecaster"
-    description: "auto: Cascade 4M on this machine. ephemeris: hosted models, only when chosen here and a key is saved below"
+    description: "auto: Cascade 4M on this machine, or a built-in seasonal forecast until there are 128 hours of history. ephemeris: hosted models, only when chosen here and a key is saved below"
   ephemeris_api_key:
     type: secret
     env: EPHEMERIS_API_KEY
@@ -92,6 +92,12 @@ config_schema:
     default: toto2-313m
     label: "Advanced · Ephemeris model"
     description: "Model for Ephemeris forecasts, or 'route' to let Ephemeris pick"
+  price_list:
+    type: str
+    choices: ["on", "off"]
+    default: "on"
+    label: "Advanced · fetch OpenRouter's public price list"
+    description: "At most once a day, or hourly while the fetch is failing. No key, nothing about you sent. Off: only your own prices and a few built-in ones"
   prices:
     type: dict
     default: {}

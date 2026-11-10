@@ -21,6 +21,7 @@ CHECK_HOURS = (9, 12, 15)
 HEAVY = 1.7                     # this week's usage against a usual one
 WEEKS = 5                       # ordinary weeks before it: enough for the chart's range of how weeks vary
 BAR = 20                        # characters that stand for the whole limit
+METER_AT = 0.8                  # where a usual usage meter would warn, for the comparison
 
 
 def _usage(rng, scale=1.0) -> dict:
@@ -59,6 +60,18 @@ def _chip(snapshot: dict) -> dict:
         rows=[dict(r, now=snapshot["at"]) for r in snapshot.get("rows", [])])   # bars follow the demo's clock, not today's
 
 
+def _against_a_meter(seen, meter, limit) -> list:
+    """When the forecast spoke up, beside when a plain usage meter would have, on the same week with no plugin."""
+    if not seen or not meter:
+        return []
+    at = lambda t: f"{datetime.fromtimestamp(t):%a %H:%M}"
+    pct = f"{METER_AT:.0%}"
+    if seen[1] < meter:
+        return [f"  Obol saw it coming {at(seen[1])}, with ${seen[2]:.2f} of ${limit} spent. "
+                f"A meter that warns at {pct} would have waited until {at(meter)}."]
+    return [f"  A meter that warns at {pct} would have spoken up {at(meter)}, before Obol did at {at(seen[1])}."]
+
+
 def run(obol_cls, now: float, show=None) -> str:
     rng = random.Random(7)
     monday, sunday = _budget.period_bounds("week", now)
@@ -80,13 +93,14 @@ def run(obol_cls, now: float, show=None) -> str:
         usual = sum(r["cost_usd"] for r in rows) / WEEKS
         settings["budget_usd"] = limit = round(usual * 1.2)
 
-        lines, model, without, seen = [], BIG, 0.0, None
+        lines, model, without, seen, meter = [], BIG, 0.0, None, None
         for h in _working(monday, sunday):
             sim["now"] = h
             d = datetime.fromtimestamp(h)
             if d.hour in CHECK_HOURS:
                 if seen is None and o.outlook().state == "over":
-                    seen = (o.desktop_snapshot(), h)
+                    seen = (o.desktop_snapshot(), h, o.store.spent(monday, h))
+                o.pre_llm_call(session_id="demo", user_message="", model=BIG, platform="demo")   # a new turn, as in real use
                 new = o.llm_request(request={"model": BIG}, provider="demo", session_id="demo")
                 before, model = model, new["request"]["model"] if new else BIG
                 if d.hour == 12 or model != before:
@@ -96,12 +110,16 @@ def run(obol_cls, now: float, show=None) -> str:
                     lines.append(f"  {d:%a %H:%M}  {_budget.line(o.outlook(), h)}{move}")
             usage = _usage(rng, HEAVY)
             without += o.prices.cost(BIG, usage)[0]
+            if meter is None and without >= METER_AT * limit:
+                meter = h + 600
             o.store.add_call(ts=h + 600, session_id="demo", provider="demo", model=model,
                              cost_usd=o.prices.cost(model, usage)[0], cost_status="estimated", **usage)
         sim["now"] = sunday - 60
         final = o.store.spent(monday, sunday)
     head = [f"Obol demo · made-up usage, nothing saved. Limit ${limit} a week, a usual week is about ${usual:.0f}, "
-            f"this one is {HEAVY:g}× as heavy.", "  forecast: from the usage so far"]
+            f"this one is {HEAVY:g}× as heavy.", "  forecast: the same one your real usage gets, run on this machine"]
+    if seen and show:
+        head.append("  In Hermes Desktop, the chip in the status bar shows this week for 5 minutes, if Obol's Desktop half is on.")
     tail = [f"  With no plugin: ${without:.2f}, ${without - limit:.2f} over the limit.",
             f"  With Obol in save mode: ${final:.2f}."]
     chart = []
@@ -110,4 +128,4 @@ def run(obol_cls, now: float, show=None) -> str:
             show(_chip(seen[0]))
         chart = [f"  What Obol saw on {datetime.fromtimestamp(seen[1]):%a %H:%M}, against the ${limit} limit:",
                  *_bars(seen[0]["chart"])]
-    return "\n".join(head + chart + lines + tail)
+    return "\n".join(head + chart + lines + _against_a_meter(seen, meter, limit) + tail)

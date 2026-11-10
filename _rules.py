@@ -12,7 +12,7 @@
         do: block
 
 Conditions (all must hold): state, runs_out_within ("2h", "45m", "1d"), spent_pct (">=80"), request_usd,
-day_vs_usual (">3x"), provider, model, platform (globs allowed), aux (true for background calls).
+day_vs_usual (">3x"), provider, model, platform (globs allowed).
 Actions: note (tell the agent), notify (tell the user, appended to the next reply), steer (model id, or a
 ladder of them), ask (approval before tools; for a turn, it pauses until `/obol allow`), block.
 Several rules can match; block wins over ask, and steer takes the first matching rule.
@@ -27,6 +27,8 @@ STATES = ("ok", "tight", "over", "out")
 TASK_CAP = {"name": "task cap", "when": {"task_cap": True}, "do": {"block": True}}    # applies in every mode
 SEVERITY = {"ok": 0, "unknown": 0, "tight": 1, "over": 2, "out": 3}
 ACTIONS = ("note", "notify", "steer", "ask", "block")
+NUMERIC = ("spent_pct", "request_usd", "day_vs_usual")
+CONDITIONS = ("state", "runs_out_within", *NUMERIC, "provider", "model", "platform", "aux", "task_cap")
 _CMP = re.compile(r"^\s*(>=|<=|>|<|==|=)?\s*\$?\s*([0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s*(x|%)?\s*$")
 _DUR = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*(m|min|h|d)?\s*$")
 
@@ -51,6 +53,10 @@ def compare(value, spec) -> bool:
             "==": value == num, "=": value == num}[op]
 
 
+def _lower(spec):
+    return [str(s).lower() for s in spec] if isinstance(spec, list) else str(spec).lower()
+
+
 def _any(value, spec) -> bool:
     options = spec if isinstance(spec, list) else [spec]
     return any(fnmatch.fnmatch(str(value or ""), str(o)) for o in options)
@@ -68,7 +74,10 @@ def matches(when: dict, ctx: dict) -> bool:
         elif key in ("spent_pct", "request_usd", "day_vs_usual"):
             if not compare(ctx.get(key), spec):
                 return False
-        elif key in ("provider", "model", "platform"):
+        elif key == "provider":
+            if not _any(str(ctx.get(key) or "").lower(), _lower(spec)):
+                return False
+        elif key in ("model", "platform"):
             if not _any(ctx.get(key), spec):
                 return False
         elif key == "task_cap":
@@ -78,8 +87,41 @@ def matches(when: dict, ctx: dict) -> bool:
             if bool(spec) != bool(ctx.get("aux")):
                 return False
         else:
-            return False                     # an unknown condition never matches (fail safe, and visible in /obol rules)
+            return False                     # an unknown condition never matches (fail safe, and flagged by /obol rules)
     return True
+
+
+def problems(when: dict) -> list:
+    """Why this `when` can never match, in the user's terms. A typo here would otherwise leave a rule silently idle."""
+    out = []
+    for key, spec in (when or {}).items():
+        if key not in CONDITIONS:
+            out.append(f'there is no condition called "{key}"')
+        elif key == "state":
+            for s in spec if isinstance(spec, list) else [spec]:
+                if not any(fnmatch.fnmatch(v, str(s)) for v in STATES):
+                    out.append(f'"{s}" isn\'t a state (use {", ".join(STATES)})')
+        elif key == "aux" and spec:
+            out.append("aux: true can't match, because rules aren't checked on background calls")
+        elif key == "runs_out_within" and duration(spec) is None:
+            out.append(f'runs_out_within "{spec}" isn\'t a length of time (try 2h, 45m or 1d)')
+        elif key in NUMERIC and not ((isinstance(spec, (int, float)) and not isinstance(spec, bool)) or _CMP.match(str(spec))):
+            out.append(f'{key} "{spec}" isn\'t a number to compare against (try ">3")')
+    return out
+
+
+def why_ignored(rule) -> str:
+    """Why `normalize` refused this rule, in the user's terms."""
+    if not isinstance(rule, dict):
+        return "a rule has to be an object with `when` and `do`"
+    do = rule.get("do")
+    actions = {do: True} if isinstance(do, str) else do
+    if not isinstance(actions, dict) or not actions:
+        return "`do` is missing"
+    bad = [k for k in actions if k not in ACTIONS]
+    if bad:
+        return f'"{bad[0]}" isn\'t an action (use {", ".join(ACTIONS)})'
+    return "`when` has to be an object, like {\"state\": \"over\"}"
 
 
 def normalize(rule) -> dict | None:
