@@ -342,13 +342,24 @@ class Obol:
             while True:
                 try:
                     if (self.data_dir / "obol.db").exists():   # never used on this profile: nothing to show
-                        self.redraw_desktop()
+                        self.tick()
                 except Exception:
                     log.debug("obol: couldn't refresh the chip", exc_info=True)
                 time.sleep(every)
 
         # Same context as register(), so a background tick resolves the same profile directory.
         threading.Thread(target=contextvars.copy_context().run, args=(run,), name="obol-chip", daemon=True).start()
+
+    def tick(self) -> None:
+        """One timer beat: re-read plan limits that have gone stale, then redraw the chip.
+        A plan fills from Claude Code, claude.ai or Codex too, so a reading can't wait for the next Hermes request."""
+        if self._limits_on():
+            now = self.clock()
+            for p in _limits.PROVIDERS:
+                rec = self.store.meta(f"limits:{p}") or {}
+                if rec.get("windows") and now - (rec.get("read_at") or 0) > LIMITS_AGED:
+                    self.read_limits_later(p)
+        self.redraw_desktop()
 
     def _on(self, key: str) -> bool:
         value = self._get(key, "on")                # YAML reads a bare `off` as False

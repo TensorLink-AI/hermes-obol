@@ -232,7 +232,7 @@ model-match test in `tests/` can.
 
 **Desktop.** The plugin writes a small `desktop.json` to its own data folder with the figures the chip shows. Its backend route, `/api/plugins/obol/status`, only reads that file, and the chip makes no other requests.
 
-**Plan limits.** While you use a Claude or Codex plan, at most every 5 minutes, Obol asks Hermes for that login's limits with `agent.account_usage.fetch_account_usage(read_only=True)`. `/obol limits` and your first `/obol` ask about both providers. Hermes makes the request to the vendor with the credential it resolves, and for Claude it may refresh that login itself; Obol never sees the credential, and stores only the window names, percentages and reset times. Turn it off with the `plan_limits` setting.
+**Plan limits.** While you use a Claude or Codex plan (at most every 5 minutes), and every 15 minutes while the gateway runs once a login has answered, Obol asks Hermes for that login's limits with `agent.account_usage.fetch_account_usage(read_only=True)`. `/obol limits` and your first `/obol` ask about both providers. Hermes makes the request to the vendor with the credential it resolves, and for Claude it may refresh that login itself; Obol never sees the credential, and stores only the window names, percentages and reset times. Turn it off with the `plan_limits` setting.
 
 - **What it reads:** the token counts and model of each provider request, from Hermes's
   `post_api_request` and `post_auxiliary_call` hooks. To estimate a request's size before it goes, it counts the
@@ -265,7 +265,9 @@ model-match test in `tests/` can.
     (`openrouter.ai/api/v1/models`), with no key and nothing about you sent. Turn it off with the `price_list` setting.
 - **Background work:** the local Cascade forecast takes about 20 ms and runs inside a hook. Three kinds of short-lived
   background thread do the network requests above: Ephemeris forecasts, plan-limit reads and the price list. One
-  long-lived timer thread rewrites `desktop.json` every 30 seconds from saved data. No subprocesses, no telemetry.
+  long-lived timer thread rewrites `desktop.json` every 30 seconds from saved data, and re-reads a signed-in plan's
+  limits once that reading is over 15 minutes old (your plan also fills from Claude Code, claude.ai or Codex, which
+  Hermes never sees). No subprocesses, no telemetry.
 - **Credentials:** the optional Ephemeris key is a `secret` setting, read with
   `agent.secret_scope.get_secret`. Obol never reads `.env`, `auth.json` or any other tool's credentials.
 

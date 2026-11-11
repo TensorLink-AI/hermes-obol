@@ -1359,6 +1359,28 @@ def test_the_chip_timer_writes_once_the_profile_has_data(make, tmp_path):
     assert any(t.name == "obol-chip" and t.daemon for t in threading.enumerate())
 
 
+def test_the_timer_rereads_a_stale_plan_reading_without_any_hermes_request(make, monkeypatch):
+    import time
+    from obol import _limits
+    o = make({})
+    monkeypatch.setattr(_limits, "read", lambda p: {"windows": [{"label": "Current week", "used": 32.0, "scope": "account",
+                                                                 "reset_at": o.clock() + 3 * 86400}] if p == "anthropic" else [],
+                                                    "error": None if p == "anthropic" else "not signed in to Hermes"})
+    o.read_limits("anthropic"); o.read_limits("openai-codex")
+    seen = []
+    monkeypatch.setattr(_limits, "read", lambda p: (seen.append(p), {"windows": [{"label": "Current week", "used": 67.0,
+                        "scope": "account", "reset_at": o.clock() + 3 * 86400}], "error": None})[1])
+    o.tick()
+    assert seen == []                       # fresh: no read
+    o.clock_obj.t += 20 * 60
+    o.tick()
+    deadline = time.time() + 5
+    while o.store.meta("limits:anthropic")["windows"][0]["used"] != 67.0 and time.time() < deadline:
+        time.sleep(0.01)
+    assert seen == ["anthropic"]             # never signed in to Codex: not tried again
+    assert o.store.meta("limits:anthropic")["windows"][0]["used"] == 67.0
+
+
 def test_a_finished_model_forecast_reaches_the_chip(make, tmp_path, monkeypatch):
     import threading
     o = make({"budget_usd": 30})
