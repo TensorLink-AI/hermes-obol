@@ -79,6 +79,10 @@ The percentages are the vendor's, so they include Claude Code, claude.ai and Cod
 every 15 minutes. When Hermes was busy but the percent barely moved, most use is coming from elsewhere, so Obol projects
 from your pace so far and says so.
 
+Readings come through Hermes's own Claude or Codex sign-in. If Hermes can't read them for over an hour, the chip,
+`/obol` and (once a day) a message say so instead of showing an old percent: run `/usage` in Hermes, and sign in again
+if it's empty.
+
 ## Hermes Desktop
 
 The status-bar chip shows whichever budget or plan limit is closest to running out (`$6.20/$20 · out ~Fri 14:00`,

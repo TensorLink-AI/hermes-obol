@@ -1971,3 +1971,51 @@ def test_the_demo_names_its_forecaster_and_the_chip(make):
     out = _commands.run(o, "demo")
     assert "from the usage so far" not in out and "on this machine" in out
     assert "the chip in the status bar" in out
+
+
+def test_a_plan_that_stops_answering_says_so_instead_of_an_old_percent(make, monkeypatch, tmp_path):
+    from obol import _limits
+    o = make({})
+    monkeypatch.setattr(_limits, "read", lambda p: {"windows": [{"label": "Current week", "used": 60.0, "scope": "account",
+                                                                 "reset_at": o.clock() + 3 * 86400}] if p == "anthropic" else [],
+                                                    "error": None if p == "anthropic" else "not signed in to Hermes"})
+    o.read_limits("anthropic"); o.read_limits("openai-codex")
+    assert o.desktop_snapshot()["chip"].startswith("Claude week 60%")
+    monkeypatch.setattr(_limits, "read", lambda p: {"windows": [], "error": "not signed in to Hermes, or the vendor didn't answer"})
+    o.clock_obj.t += 30 * 60
+    o.read_limits("anthropic")
+    assert o.desktop_snapshot()["chip"].startswith("Claude week 60%")      # a recent reading still stands
+    o.clock_obj.t += 2 * 86400
+    o.read_limits("anthropic")
+    s = o.desktop_snapshot()
+    assert s["chip"].startswith("Claude: can't read limits") and "60%" not in s["chip"]
+    assert "/usage" in s["lines"][0] and "sign in to Claude in Hermes again" in s["lines"][0] and s["rows"] == []
+
+
+def test_a_failed_chip_write_leaves_no_temp_file(make, tmp_path, monkeypatch):
+    from pathlib import Path
+    o = make({"budget_usd": 30})
+    feed(o, 5, 0.5)
+    real = Path.replace
+    monkeypatch.setattr(Path, "replace", lambda self, target: (_ for _ in ()).throw(PermissionError("in use")))
+    o.write_desktop()
+    monkeypatch.setattr(Path, "replace", real)
+    assert not list(tmp_path.glob("desktop.*.tmp"))
+
+
+def test_a_lost_plan_shows_in_obol_and_is_told_once_a_day(make, monkeypatch):
+    from obol import _limits
+    o = make({})
+    monkeypatch.setattr(_limits, "read", lambda p: {"windows": [{"label": "Current week", "used": 60.0, "scope": "account",
+                        "reset_at": o.clock() + 5 * 86400}] if p == "anthropic" else [], "error": None if p == "anthropic" else "not signed in to Hermes"})
+    o.read_limits("anthropic"); o.read_limits("openai-codex")
+    monkeypatch.setattr(_limits, "read", lambda p: {"windows": [], "error": "not signed in to Hermes, or the vendor didn't answer"})
+    o.clock_obj.t += 2 * 86400
+    o.read_limits("anthropic")
+    out = _commands.run(o, "")
+    assert "can't read the plan limits" in out and "60% used" not in out
+    told = []
+    monkeypatch.setattr(o, "_queue_notice", lambda sid, text: told.append(text))
+    o.pre_llm_call(session_id="s", user_message="hi", conversation_history=[])
+    o.pre_llm_call(session_id="s", user_message="hi", conversation_history=[])
+    assert len(told) == 1 and "sign in to Claude in Hermes again" in told[0]

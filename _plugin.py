@@ -40,7 +40,8 @@ LIMITS_STALE = HOUR              # older than this, a reading is shown but not a
 LIMITS_AGED = 15 * 60            # older than this, a reading says how old it is
 ALLOW_FOR = HOUR                 # /obol allow: how long it waits for a turn, and how long that turn's tools run
 # Providers that serve only their own models. Routers (OpenRouter and the like) can serve anything.
-WEEK = 7 * 24 * HOUR
+DAY = 24 * HOUR
+WEEK = 7 * DAY
 FORECAST_AFTER = 24 * HOUR       # with less history than this, one busy hour would be repeated all week
 LOCAL_PROVIDERS = ("local", "ollama", "lmstudio", "llamacpp", "vllm")
 # Providers that serve many vendors' models. `demo` is /obol demo's made-up provider.
@@ -254,7 +255,7 @@ class Obol:
                 chart = self._window_chart(r["window"])
                 if chart:
                     return chart, r
-        return self._window_chart(top["window"]), top
+        return (self._window_chart(top["window"]) if top.get("window") else None), top
 
     def show_demo(self, snapshot: dict) -> None:
         """Put /obol demo's made-up chart on the chip for a few minutes. It's labelled, and it can't raise an alert."""
@@ -277,6 +278,10 @@ class Obol:
                                        "expected": None if o.end_median is None else 100 * o.end_median / o.usd,
                                        "start": o.start, "end": o.end, "out_at": o.out_median}})
         for p in _limits.PROVIDERS:
+            lost = self._limits_lost(p)
+            if lost:
+                rows.append(lost)
+                continue
             for w in self.limit_windows(p, with_path=True):
                 how = {"forecast": "your token history", "pace": "your pace so far"}.get(w["how"], "")
                 size = _limits.length(w["label"])
@@ -323,9 +328,12 @@ class Obol:
                 snapshot["at"] = json.loads(path.read_text()).get("at") or snapshot["at"]
             tmp = path.with_suffix(f".{threading.get_ident()}.tmp")
             tmp.write_text(json.dumps(snapshot, default=str))
-            tmp.replace(path)
+            try:
+                tmp.replace(path)       # on Windows this fails while the Desktop backend is reading the file
+            finally:
+                tmp.unlink(missing_ok=True)
         except Exception:
-            log.warning("obol: couldn't write the Desktop snapshot", exc_info=True)
+            log.debug("obol: couldn't write the Desktop snapshot", exc_info=True)
 
     def redraw_desktop(self) -> None:
         """Rewrite the chip from saved data, for threads with no request behind them. Runs no forecast, paid or local."""
@@ -475,6 +483,21 @@ class Obol:
                              line=self._window_line(name, w["label"], used, reset, p, st, now)
                              + (f" · read {age} ago" if age else "")))
         return _limits.worst_first(rows)
+
+    def _limits_lost(self, provider: str):
+        """A plan Obol used to read but now can't: say so, rather than show an old percent as if it were current."""
+        if not self._limits_on():
+            return None
+        rec = self.store.meta(f"limits:{provider}") or {}
+        now = self.clock()
+        if not rec.get("error") or not rec.get("read_at") or now - rec["read_at"] <= LIMITS_STALE:
+            return None
+        name = _limits.NAMES.get(provider, provider)
+        age = _budget.ago(now - rec["read_at"])
+        line = (f"{name}: can't read the plan limits ({age} since the last reading). "
+                f"Run /usage in Hermes; if it shows nothing for {name}, sign in to {name} in Hermes again.")
+        return {"state": "unknown", "out": None, "budget": None, "window": None, "line": line,
+                "chip": f"{name}: can't read limits ({age})", "model": "", "meter": None}
 
     def _window_source(self, provider, label, rec, tokens_in, used):
         """Whether Hermes is what's filling this window. Worked out once per reading: the hooks ask on every call."""
@@ -782,6 +805,10 @@ class Obol:
             return None
         sid = kw.get("session_id") or ""
         self.store.set_meta(f"allowed_turn:{sid}", None)    # runs once per turn: last turn's allowance is over
+        for p in _limits.PROVIDERS:                         # a plan gone dark for a day: say so, once a day
+            lost = self._limits_lost(p)
+            if lost and self.clock() - (self.store.meta(f"limits:{p}") or {}).get("read_at", 0) > DAY:
+                self._tell_once(f"limits_lost:{p}", sid, lost["line"])
         if (held := self.store.meta("steer_held")) and not held["ready"]:
             self.store.set_meta("steer_held", dict(held, ready=True))   # the warned turn is over: this one may switch
         # The hook sees the conversation but not the system prompt or tool definitions, so start from the size
@@ -1101,7 +1128,7 @@ class Obol:
         rows.sort(key=lambda r: (_rules.SEVERITY.get(r[1].state, 0), -(r[1].out_median or float("inf"))), reverse=True)
         b, o = rows[0] if rows else (self.budget(), None)
         out = {"budget": vars(b), "line": _budget.line(o, now) if o else "no budget set (/obol budget 20 week)"}
-        out["limits"] = [w for p in _limits.PROVIDERS for w in self.limit_windows(p)]
+        out["limits"] = [w for p in _limits.PROVIDERS if not self._limits_lost(p) for w in self.limit_windows(p)]
         if o:
             out.update(state=o.state, spent=round(o.spent, 4), period_end=o.end, forecaster=o.tier, model=o.model,
                        expected_period_total=o.end_median, runs_out_at=o.out_median,

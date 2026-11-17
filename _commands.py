@@ -239,7 +239,7 @@ def _status(obol) -> str:
         lines.append(f"  what if: on {what['model']}, {what['text']}" + ("" if b["mode"] == "save" else f" ({verb})"))
     if b["mode"] == "save" and not b["cheap_model"]:
         lines.append("  ⚠ save mode can't switch yet: pick a model with /obol cheap <model>")
-    lines += [f"  {w['line']}" for w in s["limits"][:3]]
+    lines += [f"  {w['line']}" for w in s["limits"][:3]] + [x for x in _failed_reads(obol) if "⚠" in x]
     if len(s.get("budgets") or []) > 1:
         for r in s["budgets"]:
             lines.append(f"  {r['label']}: {r['line']}")
@@ -326,6 +326,9 @@ def _failed_reads(obol) -> list:
     a provider only counts as failing if the read broke or it's the one requests are going to."""
     out, latest = [], obol.store.latest_provider()
     for p in _limits.PROVIDERS:
+        if lost := obol._limits_lost(p):
+            out.append(f"  ⚠ {lost['line']}")
+            continue
         rec = obol.store.meta(f"limits:{p}") or {}
         err = rec.get("error")
         if err and not rec.get("windows") and (err.startswith("couldn't") or (p == latest and "OAuth" not in err)):
