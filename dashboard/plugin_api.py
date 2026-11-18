@@ -6,6 +6,7 @@ touches the ledger from the gateway's web server.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -21,10 +22,13 @@ def snapshot(home: Path) -> dict:
     found = [p for p in [root / "obol" / "desktop.json", *root.glob("agent-plugin-obol-*/desktop.json")] if p.is_file()]
     if not found:
         return EMPTY
-    try:
-        return json.loads(max(found, key=lambda p: p.stat().st_mtime).read_text())
-    except (OSError, ValueError):
-        return EMPTY
+    for _ in range(3):        # on Windows the file can't be opened for the moment the plugin is replacing it
+        try:
+            return json.loads(max(found, key=lambda p: p.stat().st_mtime).read_text())
+        except (OSError, ValueError):
+            time.sleep(0.05)
+    return {"state": "none", "chip": "Obol", "lines": ["Obol couldn't read its status just now. It retries in a moment."],
+            "retry": True}
 
 
 @router.get("/status")

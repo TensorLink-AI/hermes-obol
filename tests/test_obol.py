@@ -1029,7 +1029,7 @@ def test_negative_catalogue_prices_are_unknown():
 
 def test_month_chart_covers_the_month(make):
     late = make({"budget_usd": 100000, "period": "month"}, now=1_764_460_800.0)      # the 30th: a full month of actuals
-    feed(late, 690, 0.1)
+    feed(late, 720, 0.1)     # back past the 1st in any zone, up to UTC+14
     c = late._chart(late.budget())
     assert len(c["actual"]) <= 200 and c["actual"][0][0] == c["start"] and c["actual"][-1][0] == late.clock()
     assert c["actual"][1][0] < c["start"] + 12 * HOUR
@@ -1281,7 +1281,7 @@ def test_snapshot_is_written_for_the_backend_and_throttled(make, tmp_path):
     o.write_desktop()
     assert api.snapshot(tmp_path)["chip"].startswith("$")
     (o._data_dir / "desktop.json").write_text("not json")
-    assert api.snapshot(tmp_path)["state"] == "none"
+    assert api.snapshot(tmp_path)["state"] == "none" and api.snapshot(tmp_path)["retry"]   # the chip keeps what it had
     o.clock_obj.t += 10
     o.write_desktop(every=60)
     assert (o._data_dir / "desktop.json").read_text() == "not json"
@@ -2019,3 +2019,37 @@ def test_a_lost_plan_shows_in_obol_and_is_told_once_a_day(make, monkeypatch):
     o.pre_llm_call(session_id="s", user_message="hi", conversation_history=[])
     o.pre_llm_call(session_id="s", user_message="hi", conversation_history=[])
     assert len(told) == 1 and "sign in to Claude in Hermes again" in told[0]
+
+
+def test_a_price_list_that_stops_arriving_is_reported(make):
+    o = make({"budget_usd": 30})
+    feed(o, 50, 0.1)
+    assert "price list" not in _commands.run(o, "")
+    o.prices.updated_at = lambda: o.clock() - 5 * 86400
+    assert "couldn't fetch OpenRouter's price list (last updated 5d ago)" in _commands.run(o, "")
+    o.cfg["price_list"] = "off"
+    assert "price list" not in _commands.run(o, "")
+
+
+def test_a_stop_holds_when_even_the_settings_cant_be_read(make, monkeypatch):
+    import sqlite3
+    o = make({"budget_usd": 10, "mode": "stop"})
+    monkeypatch.setattr(_plugin, "_obol", o)
+    def broken(**kw):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(o, "stops_anything", lambda: (_ for _ in ()).throw(sqlite3.OperationalError("locked")))
+    r = _plugin._guard(broken)(session_id="s")
+    assert r["action"] == "block" and "spend ledger" in r["message"]
+
+
+def test_history_imports_from_a_home_with_awkward_characters(tmp_path):
+    import os
+    home = tmp_path / ("Application Support #1" + ("" if os.name == "nt" else "?"))   # Windows forbids '?' in names
+    data = home / "plugin-data" / "obol"
+    data.mkdir(parents=True)
+    now = 1_762_340_400.0
+    _fake_state_db(home, now)
+    o = obol.Obol(data_dir=data, get=lambda k, d=None: None, set_=lambda k, v: None, secret=lambda n: None,
+                  clock=Clock(now))
+    o.prices.stale = lambda now=None: False
+    assert o.learn_history()["sessions"] == 3

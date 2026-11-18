@@ -94,6 +94,14 @@ class Prices:
         except Exception:
             return True
 
+    def updated_at(self):
+        """When the price list last arrived (None: never). A failed fetch keeps this, so it shows how old prices are."""
+        try:
+            d = json.loads(self.path.read_text())
+            return d.get("updated_at", d.get("fetched_at") if d.get("rates") else None)
+        except Exception:
+            return None
+
     def refresh_async(self, on_done=None) -> None:
         """Fetch the catalogue in a background thread (never inside a hook's critical path)."""
         with self._lock:
@@ -110,7 +118,8 @@ class Prices:
                     raise ValueError("empty price list")
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = self.path.with_suffix(".tmp")
-                tmp.write_text(json.dumps({"fetched_at": time.time(), "rates": rates}))
+                now = time.time()
+                tmp.write_text(json.dumps({"fetched_at": now, "updated_at": now, "rates": rates}))
                 tmp.replace(self.path)
                 self._table = {k: tuple(v) for k, v in rates.items()}
                 if on_done:
@@ -128,7 +137,7 @@ class Prices:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(json.dumps({"fetched_at": time.time() - REFRESH_SECONDS + RETRY_SECONDS,
-                                             "rates": self._catalogue()}))
+                                             "updated_at": self.updated_at(), "rates": self._catalogue()}))
         except Exception:
             pass
 

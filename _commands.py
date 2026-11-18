@@ -269,7 +269,16 @@ def _status(obol) -> str:
                      "then /obol forecaster ephemeris)")
     if err := s.get("last_error"):
         lines.append(f"  {err['tier']} unavailable ({err['error'][:80]}); using the local forecast")
+    lines += _prices_line(s)
     return "\n".join(lines)
+
+
+def _prices_line(s) -> list:
+    if "prices_old" not in s:
+        return []
+    old = s["prices_old"]
+    return [f"  ⚠ couldn't fetch OpenRouter's price list ({'last updated ' + old + ' ago' if old else 'never fetched'}), "
+            "so costs use older or built-in prices. It retries hourly; set `prices` to use your own."]
 
 
 def _nice(x: float) -> float:
@@ -288,7 +297,7 @@ def _no_budget(obol, s) -> str:
     lines = [f"Obol · {' and '.join(plans)} plan{'s' if len(plans) > 1 else ''}: nothing to set up" if plans
              else "Obol · no budget yet"]
     lines += [f"  {w['line']}" for w in s["limits"][:3]]
-    lines += _failed_reads(obol) + _switch_line(s) + _history_line(s)
+    lines += _failed_reads(obol) + _switch_line(s) + _history_line(s) + _prices_line(s)
     lr = s.get("learned")
     if not u.get("spent") and not u.get("usual"):
         lines.append("  on API keys too? Set a dollar limit: /obol budget 20 week" if plans

@@ -2,7 +2,16 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import os
+import time
+
 import pytest
+
+# The suite's fixed clock (a Wednesday, 11:00 UTC) is written for UTC: in Auckland it's already Thursday, so a day's
+# budget has just reset. Pin it; test_timezones.py runs the calendar logic itself in other zones.
+if hasattr(time, "tzset"):
+    os.environ["TZ"] = "UTC"
+    time.tzset()
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -36,6 +45,7 @@ def make(tmp_path):
                           set_=cfg.__setitem__, secret=lambda n: secret, clock=clock)
         o.cfg, o.clock_obj = cfg, clock
         o.prices.stale = lambda now=None: False   # tests never fetch the catalogue
+        o.prices.updated_at = lambda: clock()     # ...and its prices are current
         o._hold_first_switch = lambda *a: False   # steering tests start past the warning; its own tests delete this
         return o
     return make

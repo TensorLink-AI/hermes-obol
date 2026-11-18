@@ -1143,6 +1143,10 @@ class Obol:
         f = self.store.meta(f"forecast:{b.provider or '*'}:{b.period}") or {}
         if f.get("note"):
             out["forecaster_note"] = f["note"]
+        if self._on("price_list") and self.store.meta("first_call_at") and now - float(self.store.meta("first_call_at")) > DAY:
+            got = self.prices.updated_at()
+            if got is None or now - got > 3 * DAY:
+                out["prices_old"] = None if got is None else _budget.ago(now - got)
         err = self.store.meta("last_error")
         if err and now - err["at"] < FAIL_BACKOFF:
             out["last_error"] = err
@@ -1197,7 +1201,11 @@ def _guard(fn):
             return fn(**kw)
         except sqlite3.OperationalError:
             log.warning("obol: %s couldn't read the ledger", fn.__name__, exc_info=True)
-            if _obol is not None and _obol.stops_anything():
+            try:
+                stops = _obol is not None and _obol.stops_anything()
+            except Exception:              # the settings can need the ledger too: then assume a stop could be in force
+                stops = True
+            if stops:
                 return {"action": "block", "message": "Obol: couldn't read its spend ledger, so it can't confirm you're under "
                                                       "your limit. Try again in a moment. If this keeps happening: "
                                                       "hermes plugins disable obol"}

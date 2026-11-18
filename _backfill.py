@@ -29,7 +29,7 @@ def import_history(store, data_dir: Path, price, now: float) -> dict:
         return {}
     cutoff = float(store.meta("first_call_at") or now)          # Obol's own data starts here
     floor = max(0.0, cutoff - MAX_DAYS * 86400)
-    uri = f"file:{db}?mode=ro"
+    uri = Path(db).resolve().as_uri() + "?mode=ro"     # escaped: spaces, # or ? in a home folder name
     with closing(sqlite3.connect(uri, uri=True, timeout=5)) as c:
         cols = {r[1] for r in c.execute("PRAGMA table_info(sessions)")}
         need = {"id", "started_at", "model", "input_tokens", "output_tokens"}

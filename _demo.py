@@ -32,7 +32,8 @@ def _usage(rng, scale=1.0) -> dict:
 
 def _working(start: float, end: float):
     """The working hours from start to end, Monday to Friday."""
-    for h in range(int(start // HOUR) * HOUR, int(end), HOUR):
+    first = int(datetime.fromtimestamp(start).replace(minute=0, second=0, microsecond=0).timestamp())
+    for h in range(first, int(end), HOUR):     # local hours: in India or Nepal they aren't on the UTC hour
         d = datetime.fromtimestamp(h)
         if d.weekday() < 5 and d.hour in WORK_HOURS:
             yield h

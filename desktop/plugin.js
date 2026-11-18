@@ -262,11 +262,15 @@ function Chip({ ctx }) {
   useEffect(() => {
     let alive = true
     let last = null
+    let misses = 0
     const load = () =>
       ctx
         .rest('/status')
         .then(next => {
           if (!alive) return
+          // A read that lost a race with the plugin's write: keep what's up for a couple of polls, not "no usage yet"
+          if (next.retry && last && ++misses < 3) return
+          misses = 0
           setData(next)
           // Worse than before; a demo ending isn't news.
           const worse = WARN.includes(next.state) && (!WARN.includes(last) || (last === 'over' && next.state === 'out'))
